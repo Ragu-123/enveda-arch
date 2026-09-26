@@ -13,10 +13,11 @@ import torch
 from torch.utils.data import Dataset
 
 def get_rdkit():
-    """Dynamically loads RDKit to prevent stale cached import failures."""
+    """Dynamically loads RDKit to prevent stale cached import failures and disables stderr noise."""
     try:
-        from rdkit import Chem
+        from rdkit import Chem, rdBase
         from rdkit.Chem import AllChem
+        rdBase.DisableLog('rdApp.warning')
         return Chem, AllChem
     except ImportError:
         return None, None
