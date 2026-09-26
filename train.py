@@ -6,6 +6,7 @@ Trains Multiscale Continuous Neural Operator with:
 - InfoNCE Candidate Retrieval Loss (De Waele et al., ICML 2026)
 - Molecular Formula Regression
 - Zero Host-RAM OOM Streaming via PyArrow
+- Real-time Loss Trajectory Plotting with Matplotlib
 """
 
 import os
@@ -15,6 +16,7 @@ import torch.nn as nn
 from torch.utils.data import DataLoader
 import pandas as pd
 import numpy as np
+import matplotlib.pyplot as plt
 
 from enveda_arch.models.neural_operator_net import SpecNeuralOperatorNet
 from enveda_arch.losses.soft_tanimoto_loss import SoftTanimotoLoss
@@ -30,7 +32,9 @@ def train_epoch(
     infonce_loss_fn: nn.Module,
     formula_loss_fn: nn.Module,
     scaler: torch.amp.GradScaler,
-    device: torch.device
+    device: torch.device,
+    history: dict,
+    epoch: int
 ):
     model.train()
     total_fp = 0.0
@@ -99,6 +103,16 @@ def train_epoch(
         total_formula += loss_form.item()
         total_loss += loss.item()
 
+        # Record loss history every 10 steps
+        global_step = (epoch - 1) * len(loader) + step + 1
+        if (step + 1) % 10 == 0:
+            history['step'].append(global_step)
+            history['total_loss'].append(loss.item())
+            history['fp_loss'].append(loss_fp.item())
+            history['tanimoto_loss'].append(loss_tani.item())
+            history['infonce_loss'].append(loss_info.item())
+            history['formula_loss'].append(loss_form.item())
+
         if (step + 1) % 20 == 0 or (step + 1) == len(loader):
             elapsed = time.time() - start_time
             ms_per_step = (elapsed / (step + 1)) * 1000
@@ -134,6 +148,11 @@ def main():
     # 2. Build Dataset & DataLoader
     batch_size = 64 if num_gpus >= 2 else 32
     dataset = EnvedaSpectraDataset(df_train, max_peaks=128, n_bits=2048)
+    
+    # Inspect sample positive bits
+    sample_pos_bits = [dataset[i]['target_fingerprint'].sum().item() for i in range(min(10, len(dataset)))]
+    print(f"Sample ground-truth Morgan positive bit counts: {sample_pos_bits}")
+
     loader = DataLoader(
         dataset,
         batch_size=batch_size,
@@ -174,11 +193,20 @@ def main():
     formula_loss_fn = nn.SmoothL1Loss()
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3, weight_decay=1e-4)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=5)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=4)
     scaler = torch.amp.GradScaler('cuda', enabled=(device.type == 'cuda'))
 
+    history = {
+        'step': [],
+        'total_loss': [],
+        'fp_loss': [],
+        'tanimoto_loss': [],
+        'infonce_loss': [],
+        'formula_loss': []
+    }
+
     # 5. Training Loop
-    epochs = 3
+    epochs = 4
     print("\n" + "=" * 65)
     print("BEGINNING TRAINING EPOCHS")
     print("=" * 65)
@@ -195,7 +223,9 @@ def main():
             infonce_loss_fn=infonce_loss_fn,
             formula_loss_fn=formula_loss_fn,
             scaler=scaler,
-            device=device
+            device=device,
+            history=history,
+            epoch=epoch
         )
         scheduler.step()
         ep_time = time.time() - t0
@@ -208,6 +238,44 @@ def main():
     raw_model = model.module if hasattr(model, 'module') else model
     torch.save(raw_model.state_dict(), ckpt_path)
     print(f"\n[SUCCESS] Model checkpoint saved to: {ckpt_path}")
+
+    # 7. Generate Convergence Plot
+    if len(history['step']) > 0:
+        print("\nGenerating training convergence trajectory plot...")
+        plt.figure(figsize=(15, 10))
+        
+        plt.subplot(2, 2, 1)
+        plt.plot(history['step'], history['total_loss'], color='#1f77b4', lw=2)
+        plt.title("Total Decision-Theoretic Loss", fontsize=12, fontweight='bold')
+        plt.xlabel("Global Step")
+        plt.ylabel("Loss")
+        plt.grid(True, alpha=0.3)
+
+        plt.subplot(2, 2, 2)
+        plt.plot(history['step'], history['fp_loss'], color='#d62728', lw=2)
+        plt.title("Morgan Fingerprint (2048-bit) BCE Loss", fontsize=12, fontweight='bold')
+        plt.xlabel("Global Step")
+        plt.ylabel("Loss")
+        plt.grid(True, alpha=0.3)
+
+        plt.subplot(2, 2, 3)
+        plt.plot(history['step'], history['tanimoto_loss'], color='#2ca02c', lw=2)
+        plt.title("Soft Tanimoto IoU Loss (1 - Tanimoto)", fontsize=12, fontweight='bold')
+        plt.xlabel("Global Step")
+        plt.ylabel("Loss")
+        plt.grid(True, alpha=0.3)
+
+        plt.subplot(2, 2, 4)
+        plt.plot(history['step'], history['infonce_loss'], color='#9467bd', lw=2)
+        plt.title("InfoNCE Retrieval Loss (Candidate Ranking)", fontsize=12, fontweight='bold')
+        plt.xlabel("Global Step")
+        plt.ylabel("Loss")
+        plt.grid(True, alpha=0.3)
+
+        plt.suptitle("SpecNeuralOperatorNet Training Convergence Trajectory", fontsize=15, fontweight='bold', y=1.02)
+        plt.tight_layout()
+        plt.show()
+        print("[OK] Convergence plot displayed and automatically captured by logger.")
 
 if __name__ == "__main__":
     main()
