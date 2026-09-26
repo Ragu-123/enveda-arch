@@ -121,9 +121,9 @@ def train_epoch(
     n = len(loader)
     return total_loss / n, total_fp / n, total_tanimoto / n, total_infonce / n
 
-def main():
+def main(epochs: int = 10, max_records: int = 25000, lr: float = 1e-3):
     print("=" * 65)
-    print("ENVEDA-ARCH: TRAINING SPECCRNEURALOPERATORNET")
+    print(f"ENVEDA-ARCH: TRAINING SPECCRNEURALOPERATORNET ({epochs} EPOCHS, {max_records} RECORDS)")
     print("=" * 65)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -135,14 +135,14 @@ def main():
 
     # 1. Safe PyArrow streaming load (Memory < 300 MB, Zero OOM)
     train_path = "/kaggle/input/competitions/enveda-CASMI26-molecule-id-mass-spectra/train.parquet"
-    print("\nSafely streaming training records via PyArrow...")
+    print(f"\nSafely streaming up to {max_records} training records via PyArrow...")
     
     columns = [
         'ms2_mzs', 'ms2_normalized_intensities',
         'precursor_mz', 'collision_energy_ev', 'ionization_mode',
         'normalized_smiles', 'molecular_formula'
     ]
-    df_train = load_parquet_sample_safe(train_path, columns=columns, max_records=25000)
+    df_train = load_parquet_sample_safe(train_path, columns=columns, max_records=max_records)
     print(f"[OK] Safely loaded {len(df_train)} training records with zero memory spike.")
 
     # 2. Build Dataset & DataLoader
@@ -193,8 +193,8 @@ def main():
     infonce_loss_fn = InfoNCERetrievalLoss(temperature=0.07)
     formula_loss_fn = nn.SmoothL1Loss()
 
-    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3, weight_decay=1e-4)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=4)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs, eta_min=1e-5)
     scaler = torch.amp.GradScaler('cuda', enabled=(device.type == 'cuda'))
 
     history = {
@@ -207,9 +207,8 @@ def main():
     }
 
     # 5. Training Loop
-    epochs = 4
     print("\n" + "=" * 65)
-    print("BEGINNING TRAINING EPOCHS")
+    print(f"BEGINNING TRAINING ({epochs} EPOCHS)")
     print("=" * 65)
 
     for epoch in range(1, epochs + 1):
@@ -279,4 +278,10 @@ def main():
         print("[OK] Convergence plot displayed and automatically captured by logger.")
 
 if __name__ == "__main__":
-    main()
+    import argparse
+    parser = argparse.ArgumentParser(description="Train SpecNeuralOperatorNet on MS/MS Spectra")
+    parser.add_argument("--epochs", type=int, default=10, help="Number of training epochs (default: 10)")
+    parser.add_argument("--max_records", type=int, default=25000, help="Number of spectra to load (default: 25000)")
+    parser.add_argument("--lr", type=float, default=1e-3, help="Peak learning rate (default: 1e-3)")
+    args = parser.parse_args()
+    main(epochs=args.epochs, max_records=args.max_records, lr=args.lr)
