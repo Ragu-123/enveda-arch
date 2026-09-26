@@ -37,7 +37,7 @@ def train_epoch(model, loader, optimizer, asl_loss_fn, tanimoto_loss_fn, formula
 
         optimizer.zero_grad(set_to_none=True)
 
-        with torch.cuda.amp.autocast(enabled=device.type == 'cuda'):
+        with torch.amp.autocast('cuda', enabled=device.type == 'cuda'):
             outputs = model(
                 mzs=mzs,
                 intensities=intensities,
@@ -115,7 +115,7 @@ def main():
     formula_loss_fn = nn.SmoothL1Loss()
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3, weight_decay=1e-4)
-    scaler = torch.cuda.amp.GradScaler(enabled=device.type == 'cuda')
+    scaler = torch.amp.GradScaler('cuda', enabled=device.type == 'cuda')
 
     epochs = 3
     print(f"\nStarting {epochs} epochs of high-throughput training...")
