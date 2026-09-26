@@ -20,6 +20,7 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
 
+from tqdm import tqdm
 from enveda_arch.models.neural_operator_net import SpecNeuralOperatorNet
 from enveda_arch.losses.asymmetric_loss import AsymmetricLoss
 from enveda_arch.losses.soft_tanimoto_loss import SoftTanimotoLoss
@@ -38,7 +39,9 @@ def train_epoch(
     scaler: torch.amp.GradScaler,
     device: torch.device,
     history: dict,
-    epoch: int
+    epoch: int,
+    epochs: int,
+    log_file: Optional[str] = "/kaggle/working/training.log"
 ):
     model.train()
     total_fp = 0.0
@@ -50,7 +53,15 @@ def train_epoch(
 
     raw_model = model.module if hasattr(model, 'module') else model
 
-    for step, batch in enumerate(loader):
+    pbar = tqdm(
+        loader,
+        desc=f"Epoch {epoch:2d}/{epochs:2d}",
+        total=len(loader),
+        dynamic_ncols=True,
+        leave=True
+    )
+
+    for step, batch in enumerate(pbar):
         mzs = batch["mzs"].to(device)
         intensities = batch["intensities"].to(device)
         precursor_mz = batch["precursor_mz"].to(device)
@@ -92,7 +103,6 @@ def train_epoch(
 
         # Robust defensive check
         if torch.isnan(loss) or torch.isinf(loss):
-            print(f"Warning: Step {step} produced NaN/Inf loss, skipping backward.")
             optimizer.zero_grad(set_to_none=True)
             continue
 
@@ -108,6 +118,15 @@ def train_epoch(
         total_formula += loss_form.item()
         total_loss += loss.item()
 
+        # Update tqdm live metrics display
+        pbar.set_postfix({
+            "Loss": f"{loss.item():.4f}",
+            "ASL": f"{loss_fp.item():.4f}",
+            "Tani": f"{loss_tani.item():.4f}",
+            "InfoNCE": f"{loss_info.item():.4f}",
+            "Form": f"{loss_form.item():.4f}"
+        })
+
         # Record step-by-step history every 10 steps
         global_step = (epoch - 1) * len(loader) + step + 1
         if (step + 1) % 10 == 0:
@@ -118,10 +137,25 @@ def train_epoch(
             history['infonce_loss'].append(loss_info.item())
             history['formula_loss'].append(loss_form.item())
 
-        if (step + 1) % 20 == 0 or (step + 1) == len(loader):
+        # Stepwise logging to .log file every 20 steps or at end of loader
+        if log_file and ((step + 1) % 20 == 0 or (step + 1) == len(loader) or step == 0):
             elapsed = time.time() - start_time
             ms_per_step = (elapsed / (step + 1)) * 1000
-            print(f"  Step [{step+1:3d}/{len(loader):3d}] | Total: {loss.item():.4f} | FP: {loss_fp.item():.4f} | Tani: {loss_tani.item():.4f} | InfoNCE: {loss_info.item():.4f} | Form: {loss_form.item():.4f} | ({ms_per_step:.1f} ms/step)")
+            ts = time.strftime("%Y-%m-%d %H:%M:%S")
+            log_line = (
+                f"{ts} | Epoch {epoch:2d}/{epochs:2d} | "
+                f"Step [{step+1:5d}/{len(loader):5d}] | "
+                f"Total: {loss.item():.4f} | ASL: {loss_fp.item():.4f} | "
+                f"Tani: {loss_tani.item():.4f} | InfoNCE: {loss_info.item():.4f} | "
+                f"Form: {loss_form.item():.4f} | ({ms_per_step:.1f} ms/step)\n"
+            )
+            try:
+                os.makedirs(os.path.dirname(log_file), exist_ok=True)
+                with open(log_file, "a") as f:
+                    f.write(log_line)
+                    f.flush()
+            except Exception:
+                pass
 
     n = len(loader)
     return total_loss / n, total_fp / n, total_tanimoto / n, total_infonce / n
@@ -363,6 +397,12 @@ def main(epochs: int = 10, max_records: Optional[int] = None, lr: float = 1e-3, 
     os.makedirs(checkpoint_dir, exist_ok=True)
     best_val_loss = float('inf')
 
+    log_file = "/kaggle/working/training.log"
+    os.makedirs(os.path.dirname(log_file), exist_ok=True)
+    with open(log_file, "a") as f:
+        f.write(f"\n{'='*70}\nENVEDA-ARCH TRAINING SESSION STARTED | {time.strftime('%Y-%m-%d %H:%M:%S')}\n{'='*70}\n")
+        f.flush()
+
     # 5. Training & Per-Epoch Validation Loop
     print("\n" + "=" * 65)
     print(f"BEGINNING TRAINING & PER-EPOCH VALIDATION ({epochs} EPOCHS)")
@@ -386,7 +426,9 @@ def main(epochs: int = 10, max_records: Optional[int] = None, lr: float = 1e-3, 
             scaler=scaler,
             device=device,
             history=step_history,
-            epoch=epoch
+            epoch=epoch,
+            epochs=epochs,
+            log_file=log_file
         )
         scheduler.step()
 
@@ -406,6 +448,17 @@ def main(epochs: int = 10, max_records: Optional[int] = None, lr: float = 1e-3, 
               f"Train Loss: {train_loss:.4f} (InfoNCE: {info:.4f}) | "
               f"Val Loss: {val_metrics['val_loss']:.4f} (InfoNCE: {val_metrics['val_infonce_loss']:.4f}) | "
               f"Val MRR@25: {val_metrics['mrr_25']:.4f} | Top-25: {val_metrics['top25_acc']*100:.1f}%")
+
+        if log_file:
+            with open(log_file, "a") as f:
+                f.write(
+                    f"\n--- EPOCH {epoch}/{epochs} SUMMARY ({ep_time:.1f}s) ---\n"
+                    f"  Train Loss: {train_loss:.4f} | InfoNCE: {info:.4f} | ASL: {fp_l:.4f} | Tani: {tani:.4f}\n"
+                    f"  Val Loss:   {val_metrics['val_loss']:.4f} | InfoNCE: {val_metrics['val_infonce_loss']:.4f}\n"
+                    f"  Val MRR@25: {val_metrics['mrr_25']:.4f} | Top-1: {val_metrics['top1_acc']*100:.1f}% | Top-25: {val_metrics['top25_acc']*100:.1f}%\n"
+                    f"{'-'*70}\n\n"
+                )
+                f.flush()
 
         # Record epoch metrics
         epoch_history['epoch'].append(epoch)

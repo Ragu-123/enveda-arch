@@ -47,7 +47,10 @@ def evaluate_validation(
     reciprocal_ranks = []
     total_samples = 0
 
-    for batch in loader:
+    from tqdm import tqdm
+    pbar = tqdm(loader, desc="Validating (MRR@25)", total=len(loader), dynamic_ncols=True, leave=False)
+
+    for batch in pbar:
         mzs = batch["mzs"].to(device)
         intensities = batch["intensities"].to(device)
         precursor_mz = batch["precursor_mz"].to(device)
