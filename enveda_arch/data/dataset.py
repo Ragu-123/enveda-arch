@@ -12,19 +12,24 @@ import pyarrow.parquet as pq
 import torch
 from torch.utils.data import Dataset
 
-try:
-    from rdkit import Chem
-    from rdkit.Chem import AllChem
-    HAS_RDKIT = True
-except ImportError:
-    HAS_RDKIT = False
+def get_rdkit():
+    """Dynamically loads RDKit to prevent stale cached import failures."""
+    try:
+        from rdkit import Chem
+        from rdkit.Chem import AllChem
+        return Chem, AllChem
+    except ImportError:
+        return None, None
 
 ELEMENTS = ['C', 'H', 'N', 'O', 'P', 'S', 'F', 'Cl', 'Br', 'I']
 
 def smiles_to_morgan_fingerprint(smiles: str, n_bits: int = 2048, radius: int = 2) -> np.ndarray:
     """Generates 2048-bit Morgan/ECFP4 fingerprint from SMILES string."""
     fp_arr = np.zeros((n_bits,), dtype=np.float32)
-    if not HAS_RDKIT or not isinstance(smiles, str) or not smiles:
+    if not isinstance(smiles, str) or not smiles:
+        return fp_arr
+    Chem, AllChem = get_rdkit()
+    if Chem is None or AllChem is None:
         return fp_arr
     mol = Chem.MolFromSmiles(smiles)
     if mol is None:
@@ -78,6 +83,27 @@ class EnvedaSpectraDataset(Dataset):
         self.max_peaks = max_peaks
         self.n_bits = n_bits
 
+        # Precompute fingerprints for all samples
+        print(f"Precomputing {len(self.df)} ground-truth Morgan fingerprints...")
+        smiles_list = self.df['normalized_smiles'].tolist() if 'normalized_smiles' in self.df.columns else []
+        fps_list = []
+        Chem, AllChem = get_rdkit()
+        if Chem is None:
+            raise RuntimeError("RDKit is NOT available! Install rdkit via pip before building dataset.")
+            
+        for s in smiles_list:
+            fps_list.append(smiles_to_morgan_fingerprint(s, n_bits=n_bits))
+        self.fps = np.stack(fps_list, axis=0) if len(fps_list) > 0 else np.zeros((len(self.df), n_bits), dtype=np.float32)
+        
+        mean_bits = float(self.fps.sum(axis=1).mean()) if len(self.fps) > 0 else 0.0
+        print(f"[OK] Precomputed fingerprints. Mean active bits per molecule: {mean_bits:.1f}")
+        if len(self.fps) > 0 and mean_bits < 1.0:
+            raise RuntimeError(f"CRITICAL ERROR: Mean active bits is {mean_bits:.2f}! Fingerprint generation failed!")
+
+        # Precompute formula counts
+        formulas = self.df['molecular_formula'].tolist() if 'molecular_formula' in self.df.columns else []
+        self.formulas = np.array([parse_molecular_formula(f) for f in formulas], dtype=np.float32) if len(formulas) > 0 else np.zeros((len(self.df), len(ELEMENTS)), dtype=np.float32)
+
     def __len__(self):
         return len(self.df)
 
@@ -121,11 +147,8 @@ class EnvedaSpectraDataset(Dataset):
             
         mode_val = 1.0 if row.get('ionization_mode', 'positive') == 'positive' else 0.0
         
-        # Ground truth targets
-        smiles = row.get('normalized_smiles', '')
-        fp = smiles_to_morgan_fingerprint(smiles, n_bits=self.n_bits)
-        formula = row.get('molecular_formula', '')
-        form_counts = parse_molecular_formula(formula)
+        target_fp = self.fps[idx]
+        target_formula = self.formulas[idx]
         
         return {
             "mzs": torch.tensor(padded_mzs, dtype=torch.float32),
@@ -134,6 +157,6 @@ class EnvedaSpectraDataset(Dataset):
             "collision_energy": torch.tensor([ce_val], dtype=torch.float32),
             "mode": torch.tensor([mode_val], dtype=torch.float32),
             "mask": torch.tensor(mask, dtype=torch.bool),
-            "target_fingerprint": torch.tensor(fp, dtype=torch.float32),
-            "target_formula": torch.tensor(form_counts, dtype=torch.float32)
+            "target_fingerprint": torch.tensor(target_fp, dtype=torch.float32),
+            "target_formula": torch.tensor(target_formula, dtype=torch.float32)
         }

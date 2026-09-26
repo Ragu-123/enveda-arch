@@ -37,7 +37,12 @@ def build_candidate_index_from_train(
     if os.path.exists(save_path):
         print(f"Loading cached candidate index from {save_path}...")
         data = np.load(save_path, allow_pickle=True)
-        return data["masses"], data["fps"], list(data["smiles"])
+        fps = data["fps"]
+        if fps.sum() > 0:
+            print(f"[OK] Loaded valid candidate index ({len(data['masses'])} candidates, mean active bits: {fps.sum(axis=1).mean():.1f}).")
+            return data["masses"], fps, list(data["smiles"])
+        else:
+            print(f"[WARNING] Cached candidate index at {save_path} has all-zero fingerprints! Rebuilding...")
 
     print(f"Building candidate index from {train_parquet_path}...")
     pf = pq.ParquetFile(train_parquet_path)
@@ -78,6 +83,8 @@ def build_candidate_index_from_train(
     fps = np.zeros((len(records), 2048), dtype=np.float32)
     for idx, s in enumerate(smiles_list):
         fps[idx] = smiles_to_morgan_fingerprint(s, n_bits=2048)
+    
+    assert fps.sum() > 0, "ERROR: Candidate index fingerprints are all zero! Check RDKit installation."
 
     # Cache index to disk
     os.makedirs(os.path.dirname(save_path), exist_ok=True)

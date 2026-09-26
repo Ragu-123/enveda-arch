@@ -152,6 +152,7 @@ def main():
     # Inspect sample positive bits
     sample_pos_bits = [dataset[i]['target_fingerprint'].sum().item() for i in range(min(10, len(dataset)))]
     print(f"Sample ground-truth Morgan positive bit counts: {sample_pos_bits}")
+    assert any(b > 0 for b in sample_pos_bits), "CRITICAL: Sample positive bits are all zero! RDKit is not generating fingerprints!"
 
     loader = DataLoader(
         dataset,
