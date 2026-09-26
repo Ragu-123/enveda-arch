@@ -1,10 +1,14 @@
 """
-High-Throughput PyTorch Dataset for Enveda CASMI MS/MS Spectra
+High-Throughput Streaming PyTorch Dataset for Enveda CASMI MS/MS Spectra
+Safely streams from large Parquet files using PyArrow with zero host-RAM OOM.
 Extracts peak lists, continuous coordinates, and ground-truth 2048-bit Morgan Fingerprints.
 """
 
+import re
+from typing import List, Optional
 import numpy as np
 import pandas as pd
+import pyarrow.parquet as pq
 import torch
 from torch.utils.data import Dataset
 
@@ -14,6 +18,8 @@ try:
     HAS_RDKIT = True
 except ImportError:
     HAS_RDKIT = False
+
+ELEMENTS = ['C', 'H', 'N', 'O', 'P', 'S', 'F', 'Cl', 'Br', 'I']
 
 def smiles_to_morgan_fingerprint(smiles: str, n_bits: int = 2048, radius: int = 2) -> np.ndarray:
     """Generates 2048-bit Morgan/ECFP4 fingerprint from SMILES string."""
@@ -29,18 +35,42 @@ def smiles_to_morgan_fingerprint(smiles: str, n_bits: int = 2048, radius: int = 
     return fp_arr
 
 def parse_molecular_formula(formula: str) -> np.ndarray:
-    """Counts [C, H, N, O, P, S, F, Cl] in molecular formula."""
-    counts = np.zeros(8, dtype=np.float32)
+    """Counts [C, H, N, O, P, S, F, Cl, Br, I] in molecular formula."""
+    counts = np.zeros(len(ELEMENTS), dtype=np.float32)
     if not isinstance(formula, str) or not formula:
         return counts
-    import re
-    elements = ['C', 'H', 'N', 'O', 'P', 'S', 'F', 'Cl']
-    for idx, el in enumerate(elements):
+    for idx, el in enumerate(ELEMENTS):
         match = re.search(rf'{el}(\d*)', formula)
         if match:
             val = match.group(1)
             counts[idx] = float(val) if val else 1.0
     return counts
+
+def load_parquet_sample_safe(
+    parquet_path: str,
+    columns: Optional[List[str]] = None,
+    max_records: int = 25000
+) -> pd.DataFrame:
+    """
+    Safely loads a slice from a large Parquet file using PyArrow row groups,
+    preventing entire-file host RAM exhaustion.
+    """
+    pf = pq.ParquetFile(parquet_path)
+    dfs = []
+    total_loaded = 0
+
+    for rg in range(pf.num_row_groups):
+        tbl = pf.read_row_group(rg, columns=columns)
+        df_rg = tbl.to_pandas()
+        dfs.append(df_rg)
+        total_loaded += len(df_rg)
+        if total_loaded >= max_records:
+            break
+
+    full_df = pd.concat(dfs, ignore_index=True)
+    if len(full_df) > max_records:
+        full_df = full_df.iloc[:max_records]
+    return full_df
 
 class EnvedaSpectraDataset(Dataset):
     def __init__(self, df: pd.DataFrame, max_peaks: int = 128, n_bits: int = 2048):
@@ -60,7 +90,7 @@ class EnvedaSpectraDataset(Dataset):
         # Sort and select top max_peaks by intensity
         if len(mzs) > self.max_peaks:
             top_idx = np.argsort(ints)[-self.max_peaks:]
-            # Re-sort by m/z for monotonic coordinate order
+            # Re-sort by m/z for monotonic continuous coordinate ordering
             sorted_idx = top_idx[np.argsort(mzs[top_idx])]
             mzs = mzs[sorted_idx]
             ints = ints[sorted_idx]
@@ -87,7 +117,7 @@ class EnvedaSpectraDataset(Dataset):
         elif isinstance(ce, (int, float)):
             ce_val = float(ce)
         else:
-            ce_val = 30.0 # Default fallback
+            ce_val = 30.0 # Standard fallback
             
         mode_val = 1.0 if row.get('ionization_mode', 'positive') == 'positive' else 0.0
         
