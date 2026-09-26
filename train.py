@@ -227,9 +227,10 @@ def save_and_plot_convergence(
         plt.close(fig)
         print(f"[LIVE PLOT] Updated convergence plot saved to: {output_path}")
 
-def main(epochs: int = 10, max_records: int = 25000, lr: float = 1e-3, val_ratio: float = 0.1):
+def main(epochs: int = 10, max_records: Optional[int] = None, lr: float = 1e-3, val_ratio: float = 0.1):
+    records_str = "ALL (FULL DATASET: 2.5M)" if (max_records is None or max_records <= 0) else f"{max_records:,}"
     print("=" * 65)
-    print(f"ENVEDA-ARCH: TRAINING SPECCRNEURALOPERATORNET ({epochs} EPOCHS, {max_records} RECORDS)")
+    print(f"ENVEDA-ARCH: TRAINING SPECCRNEURALOPERATORNET ({epochs} EPOCHS, {records_str})")
     print("=" * 65)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -241,7 +242,7 @@ def main(epochs: int = 10, max_records: int = 25000, lr: float = 1e-3, val_ratio
 
     # 1. Safe PyArrow streaming load (Memory < 300 MB, Zero OOM)
     train_path = "/kaggle/input/competitions/enveda-CASMI26-molecule-id-mass-spectra/train.parquet"
-    print(f"\nSafely streaming up to {max_records} training records via PyArrow...")
+    print(f"\nSafely streaming {records_str} training records via PyArrow...")
     
     columns = [
         'ms2_mzs', 'ms2_normalized_intensities',
@@ -249,7 +250,7 @@ def main(epochs: int = 10, max_records: int = 25000, lr: float = 1e-3, val_ratio
         'normalized_smiles', 'molecular_formula', 'inchikey14'
     ]
     df_raw = load_parquet_sample_safe(train_path, columns=columns, max_records=max_records)
-    print(f"[OK] Safely loaded {len(df_raw)} records with zero memory spike.")
+    print(f"[OK] Safely loaded {len(df_raw):,} records with zero memory spike.")
 
     # Grouped Split by Chemical Structure (Zero Data Leakage Guarantee)
     group_col = 'inchikey14' if 'inchikey14' in df_raw.columns and df_raw['inchikey14'].notna().any() else 'normalized_smiles'
@@ -452,7 +453,7 @@ if __name__ == "__main__":
     import argparse
     parser = argparse.ArgumentParser(description="Train SpecNeuralOperatorNet on MS/MS Spectra")
     parser.add_argument("--epochs", type=int, default=10, help="Number of training epochs (default: 10)")
-    parser.add_argument("--max_records", type=int, default=25000, help="Number of spectra to load (default: 25000)")
+    parser.add_argument("--max_records", type=int, default=None, help="Number of spectra to load (default: None for full dataset)")
     parser.add_argument("--lr", type=float, default=1e-3, help="Peak learning rate (default: 1e-3)")
     parser.add_argument("--val_ratio", type=float, default=0.1, help="Validation ratio (default: 0.1)")
     args = parser.parse_args()
