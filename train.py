@@ -80,7 +80,7 @@ def train_epoch(
             loss_form = formula_loss_fn(outputs["formula_preds"], target_form)
 
             # Unified decision-theoretic objective
-            loss = loss_asl + 2.0 * loss_tani + 1.0 * loss_info + 0.1 * loss_form
+            loss = 5.0 * loss_asl + 2.0 * loss_tani + 1.0 * loss_info + 0.1 * loss_form
 
         scaler.scale(loss).backward()
         scaler.unscale_(optimizer)

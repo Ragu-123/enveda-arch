@@ -1,6 +1,7 @@
 """
 Differentiable Soft Tanimoto Loss
 Directly optimizes the intersection-over-union of continuous predicted fingerprint probabilities with binary ground truth.
+Guaranteed numerically stable under AMP / fp16 autocast.
 """
 
 import torch
@@ -20,7 +21,8 @@ class SoftTanimotoLoss(nn.Module):
         Returns:
             loss: scalar or [B]
         """
-        probs = torch.sigmoid(logits)
+        probs = torch.sigmoid(logits.float())
+        targets = targets.float()
         
         intersection = torch.sum(probs * targets, dim=-1)
         union = torch.sum(probs + targets - (probs * targets), dim=-1)

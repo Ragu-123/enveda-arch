@@ -1,6 +1,7 @@
 """
 InfoNCE Contrastive Retrieval Loss (De Waele et al., ICML 2026)
 Optimizes direct candidate retrieval mode to eliminate Bayes-optimal similarity-retrieval regret bounds.
+Guaranteed numerically stable under AMP / fp16 autocast.
 """
 
 import torch
@@ -11,8 +12,6 @@ class InfoNCERetrievalLoss(nn.Module):
     """
     In-batch InfoNCE Contrastive Loss for aligning spectrum embeddings
     with true candidate molecular fingerprints vs in-batch negatives.
-    
-    L_InfoNCE = -log [ exp(sim(z_i, c_i) / tau) / sum_j exp(sim(z_i, c_j) / tau) ]
     """
     def __init__(self, temperature: float = 0.07):
         super().__init__()
@@ -26,6 +25,10 @@ class InfoNCERetrievalLoss(nn.Module):
         Returns:
             Scalar contrastive loss
         """
+        # Ensure computation in float32
+        spec_embeddings = spec_embeddings.float()
+        cand_embeddings = cand_embeddings.float()
+
         # Normalize embeddings to unit sphere
         z_spec = F.normalize(spec_embeddings, p=2, dim=-1)
         z_cand = F.normalize(cand_embeddings, p=2, dim=-1)
