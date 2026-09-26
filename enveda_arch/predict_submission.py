@@ -21,10 +21,13 @@ def run_submission_pipeline():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Device: {device}")
 
-    # 1. Load trained SpecNeuralOperatorNet
-    ckpt_path = "/kaggle/working/checkpoints/spec_neural_operator.pt"
+    # 1. Load trained SpecNeuralOperatorNet (prioritize best validation checkpoint)
+    ckpt_path = "/kaggle/working/checkpoints/spec_neural_operator_best.pt"
     if not os.path.exists(ckpt_path):
-        raise FileNotFoundError(f"Checkpoint not found at {ckpt_path}!")
+        ckpt_path = "/kaggle/working/checkpoints/spec_neural_operator.pt"
+    if not os.path.exists(ckpt_path):
+        raise FileNotFoundError(f"No checkpoint found at {ckpt_path}!")
+    print(f"Loading weights from checkpoint: {ckpt_path}")
 
     model = SpecNeuralOperatorNet(
         hidden_dim=256,
