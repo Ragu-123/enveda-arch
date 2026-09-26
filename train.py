@@ -21,6 +21,7 @@ import torch.nn as nn
 from torch.utils.data import DataLoader
 
 from enveda_arch.models.neural_operator_net import SpecNeuralOperatorNet
+from enveda_arch.losses.asymmetric_loss import AsymmetricLoss
 from enveda_arch.losses.soft_tanimoto_loss import SoftTanimotoLoss
 from enveda_arch.losses.infonce_loss import InfoNCERetrievalLoss
 from enveda_arch.data.dataset import EnvedaSpectraDataset, load_parquet_sample_safe
@@ -72,21 +73,22 @@ def train_epoch(
                 mask=mask
             )
 
-            # 1. Sparse multi-label loss (25x weighted for positive bits)
+            # 1. Asymmetric Loss for multi-label fingerprint prediction (gamma_neg=2.0, clip=0.05)
             loss_fp = fp_loss_fn(outputs["fingerprint_logits"], target_fp)
 
-            # 2. Soft Tanimoto IoU loss
-            loss_tani = tanimoto_loss_fn(outputs["fingerprint_logits"], target_fp)
-
-            # 3. Decision-Theoretic InfoNCE Retrieval Loss (De Waele et al., ICML 2026)
+            # 2. Metric InfoNCE Retrieval Loss (fixed target canonical fingerprint space, De Waele et al. 2026 ICML)
             cand_embeds = raw_model.project_candidate_fingerprint(target_fp)
             loss_info = infonce_loss_fn(outputs["retrieval_embedding"], cand_embeds)
 
-            # 4. Molecular formula auxiliary loss
+            # 3. Molecular formula auxiliary loss
             loss_form = formula_loss_fn(outputs["formula_preds"], target_form)
 
-            # Unified decision-theoretic objective
-            loss = loss_fp + 2.0 * loss_tani + 1.0 * loss_info + 0.1 * loss_form
+            # 4. Soft Tanimoto IoU (logged as diagnostic metric, not backpropagated to avoid opposing Bayes regret)
+            with torch.no_grad():
+                loss_tani = tanimoto_loss_fn(outputs["fingerprint_logits"], target_fp)
+
+            # Well-conditioned non-conflicting objective
+            loss = 5.0 * loss_fp + 1.0 * loss_info + 0.1 * loss_form
 
         # Robust defensive check
         if torch.isnan(loss) or torch.isinf(loss):
@@ -166,13 +168,13 @@ def save_and_plot_convergence(
     plt.legend(loc='upper right')
     plt.grid(True, alpha=0.3)
 
-    # 2. Morgan Fingerprint BCE Loss (Train vs Val)
+    # 2. Morgan Fingerprint ASL Loss (Train vs Val)
     plt.subplot(2, 2, 2)
     plt.plot(step_history['step'], step_history['fp_loss'], color='#d62728', alpha=0.35, lw=1, label="Train (Step)")
     if len(epoch_history['epoch']) > 0:
-        plt.plot(epoch_steps, epoch_history['train_fp'], 'o-', color='#d62728', lw=2.5, label="Train FP")
-        plt.plot(epoch_steps, epoch_history['val_fp'], 's--', color='#e377c2', lw=2.5, label="Val FP")
-    plt.title("Morgan Fingerprint (2048-bit) BCE Loss", fontsize=12, fontweight='bold')
+        plt.plot(epoch_steps, epoch_history['train_fp'], 'o-', color='#d62728', lw=2.5, label="Train FP (ASL)")
+        plt.plot(epoch_steps, epoch_history['val_fp'], 's--', color='#e377c2', lw=2.5, label="Val FP (ASL)")
+    plt.title("Morgan Fingerprint (2048-bit) Asymmetric Loss (ASL)", fontsize=12, fontweight='bold')
     plt.xlabel("Global Step")
     plt.ylabel("Loss")
     plt.legend(loc='upper right')
@@ -303,7 +305,7 @@ def main(epochs: int = 10, max_records: int = 25000, lr: float = 1e-3, val_ratio
     # 3. Instantiate Novel Architecture
     model = SpecNeuralOperatorNet(
         hidden_dim=256,
-        retrieval_dim=256,
+        retrieval_dim=2048,
         fingerprint_dim=2048,
         formula_dim=10,
         num_operator_layers=2,
@@ -323,10 +325,9 @@ def main(epochs: int = 10, max_records: int = 25000, lr: float = 1e-3, val_ratio
         model = nn.DataParallel(model)
 
     # 4. Numerically Stable Weighted Losses & Optimizer
-    pos_weight = torch.full((2048,), 25.0, device=device)
-    fp_loss_fn = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
+    fp_loss_fn = AsymmetricLoss(gamma_neg=2.0, gamma_pos=0.0, clip=0.05)
     tanimoto_loss_fn = SoftTanimotoLoss()
-    infonce_loss_fn = InfoNCERetrievalLoss(temperature=0.07)
+    infonce_loss_fn = InfoNCERetrievalLoss(temperature=0.15)
     formula_loss_fn = nn.SmoothL1Loss()
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)

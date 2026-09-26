@@ -14,6 +14,7 @@ import torch.nn as nn
 from torch.utils.data import DataLoader
 
 from enveda_arch.models.neural_operator_net import SpecNeuralOperatorNet
+from enveda_arch.losses.asymmetric_loss import AsymmetricLoss
 from enveda_arch.losses.soft_tanimoto_loss import SoftTanimotoLoss
 from enveda_arch.losses.infonce_loss import InfoNCERetrievalLoss
 from enveda_arch.data.dataset import EnvedaSpectraDataset, load_parquet_sample_safe
@@ -74,7 +75,7 @@ def evaluate_validation(
             loss_info = infonce_loss_fn(outputs["retrieval_embedding"], cand_embeds)
             loss_form = formula_loss_fn(outputs["formula_preds"], target_form)
 
-            batch_loss = loss_fp + 2.0 * loss_tani + 1.0 * loss_info + 0.1 * loss_form
+            batch_loss = 5.0 * loss_fp + 1.0 * loss_info + 0.1 * loss_form
 
         total_loss += batch_loss.item()
         total_fp += loss_fp.item()
@@ -152,7 +153,7 @@ def main(
     # Load Model
     model = SpecNeuralOperatorNet(
         hidden_dim=256,
-        retrieval_dim=256,
+        retrieval_dim=2048,
         fingerprint_dim=2048,
         formula_dim=10,
         num_operator_layers=2,
@@ -166,10 +167,9 @@ def main(
     print("[OK] Checkpoint loaded successfully.")
 
     # Loss functions
-    pos_weight = torch.full((2048,), 25.0, device=device)
-    fp_loss_fn = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
+    fp_loss_fn = AsymmetricLoss(gamma_neg=2.0, gamma_pos=0.0, clip=0.05)
     tanimoto_loss_fn = SoftTanimotoLoss()
-    infonce_loss_fn = InfoNCERetrievalLoss(temperature=0.07)
+    infonce_loss_fn = InfoNCERetrievalLoss(temperature=0.15)
     formula_loss_fn = nn.SmoothL1Loss()
 
     t0 = time.time()

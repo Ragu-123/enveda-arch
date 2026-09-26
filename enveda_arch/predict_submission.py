@@ -31,7 +31,7 @@ def run_submission_pipeline():
 
     model = SpecNeuralOperatorNet(
         hidden_dim=256,
-        retrieval_dim=256,
+        retrieval_dim=2048,
         fingerprint_dim=2048,
         formula_dim=10,
         num_operator_layers=2,

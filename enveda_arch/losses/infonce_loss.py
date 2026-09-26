@@ -13,7 +13,7 @@ class InfoNCERetrievalLoss(nn.Module):
     In-batch InfoNCE Contrastive Loss for aligning spectrum embeddings
     with true candidate molecular fingerprints vs in-batch negatives.
     """
-    def __init__(self, temperature: float = 0.07):
+    def __init__(self, temperature: float = 0.15):
         super().__init__()
         self.temperature = temperature
 
