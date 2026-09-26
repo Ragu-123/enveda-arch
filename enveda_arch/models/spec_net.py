@@ -109,7 +109,7 @@ class SpecContinuousNet(nn.Module):
         # 5. Permutation-Invariant Attention Pooling
         scores = self.pool_attn(x) # [B, P, 1]
         if mask is not None:
-            scores = scores.masked_fill(~mask.unsqueeze(-1), -10000.0)
+            scores = torch.where(mask.unsqueeze(-1), scores, torch.full_like(scores, -100.0))
         weights = torch.softmax(scores, dim=1) # [B, P, 1]
         
         pooled = torch.sum(x * weights, dim=1) # [B, d_model]
