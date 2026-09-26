@@ -151,7 +151,7 @@ def save_and_plot_convergence(
 
     fig = plt.figure(figsize=(16, 11))
     
-    steps_per_epoch = len(step_history['step']) // max(1, len(epoch_history['epoch'])) if len(epoch_history['epoch']) > 0 else 1
+    steps_per_epoch = (step_history['step'][-1] // max(1, len(epoch_history['epoch']))) if len(epoch_history['epoch']) > 0 and len(step_history['step']) > 0 else 1
     epoch_steps = [e * steps_per_epoch for e in epoch_history['epoch']]
 
     # 1. Total Multi-Task Decision Loss (Train vs Val)
