@@ -1,9 +1,9 @@
 """
 Training Pipeline for enveda-arch: SpecNeuralOperatorNet on Dual Tesla T4 GPUs
 Trains Multiscale Continuous Neural Operator with:
-- Asymmetric Multi-Label Loss (ASL)
-- Soft Tanimoto IoU Loss
-- InfoNCE Candidate Retrieval Loss (eliminating Bayes retrieval regret)
+- Weighted Sparse Multi-Label Cross Entropy (25x positive bit weighting)
+- Differentiable Soft Tanimoto IoU Loss
+- InfoNCE Candidate Retrieval Loss (De Waele et al., ICML 2026)
 - Molecular Formula Regression
 - Zero Host-RAM OOM Streaming via PyArrow
 """
@@ -17,7 +17,6 @@ import pandas as pd
 import numpy as np
 
 from enveda_arch.models.neural_operator_net import SpecNeuralOperatorNet
-from enveda_arch.losses.asymmetric_loss import AsymmetricLoss
 from enveda_arch.losses.soft_tanimoto_loss import SoftTanimotoLoss
 from enveda_arch.losses.infonce_loss import InfoNCERetrievalLoss
 from enveda_arch.data.dataset import EnvedaSpectraDataset, load_parquet_sample_safe
@@ -26,7 +25,7 @@ def train_epoch(
     model: nn.Module,
     loader: DataLoader,
     optimizer: torch.optim.Optimizer,
-    asl_loss_fn: nn.Module,
+    fp_loss_fn: nn.Module,
     tanimoto_loss_fn: nn.Module,
     infonce_loss_fn: nn.Module,
     formula_loss_fn: nn.Module,
@@ -34,7 +33,7 @@ def train_epoch(
     device: torch.device
 ):
     model.train()
-    total_asl = 0.0
+    total_fp = 0.0
     total_tanimoto = 0.0
     total_infonce = 0.0
     total_formula = 0.0
@@ -66,8 +65,8 @@ def train_epoch(
                 mask=mask
             )
 
-            # 1. Asymmetric multi-label loss
-            loss_asl = asl_loss_fn(outputs["fingerprint_logits"], target_fp)
+            # 1. Sparse multi-label loss (25x weighted for positive bits)
+            loss_fp = fp_loss_fn(outputs["fingerprint_logits"], target_fp)
 
             # 2. Soft Tanimoto IoU loss
             loss_tani = tanimoto_loss_fn(outputs["fingerprint_logits"], target_fp)
@@ -80,7 +79,13 @@ def train_epoch(
             loss_form = formula_loss_fn(outputs["formula_preds"], target_form)
 
             # Unified decision-theoretic objective
-            loss = 5.0 * loss_asl + 2.0 * loss_tani + 1.0 * loss_info + 0.1 * loss_form
+            loss = loss_fp + 2.0 * loss_tani + 1.0 * loss_info + 0.1 * loss_form
+
+        # Robust defensive check
+        if torch.isnan(loss) or torch.isinf(loss):
+            print(f"Warning: Step {step} produced NaN/Inf loss, skipping backward.")
+            optimizer.zero_grad(set_to_none=True)
+            continue
 
         scaler.scale(loss).backward()
         scaler.unscale_(optimizer)
@@ -88,7 +93,7 @@ def train_epoch(
         scaler.step(optimizer)
         scaler.update()
 
-        total_asl += loss_asl.item()
+        total_fp += loss_fp.item()
         total_tanimoto += loss_tani.item()
         total_infonce += loss_info.item()
         total_formula += loss_form.item()
@@ -97,10 +102,10 @@ def train_epoch(
         if (step + 1) % 20 == 0 or (step + 1) == len(loader):
             elapsed = time.time() - start_time
             ms_per_step = (elapsed / (step + 1)) * 1000
-            print(f"  Step [{step+1:3d}/{len(loader):3d}] | Total: {loss.item():.4f} | ASL: {loss_asl.item():.4f} | Tani: {loss_tani.item():.4f} | InfoNCE: {loss_info.item():.4f} | Form: {loss_form.item():.4f} | ({ms_per_step:.1f} ms/step)")
+            print(f"  Step [{step+1:3d}/{len(loader):3d}] | Total: {loss.item():.4f} | FP: {loss_fp.item():.4f} | Tani: {loss_tani.item():.4f} | InfoNCE: {loss_info.item():.4f} | Form: {loss_form.item():.4f} | ({ms_per_step:.1f} ms/step)")
 
     n = len(loader)
-    return total_loss / n, total_asl / n, total_tanimoto / n, total_infonce / n
+    return total_loss / n, total_fp / n, total_tanimoto / n, total_infonce / n
 
 def main():
     print("=" * 65)
@@ -127,7 +132,6 @@ def main():
     print(f"[OK] Safely loaded {len(df_train)} training records with zero memory spike.")
 
     # 2. Build Dataset & DataLoader
-    # Batch size scaled for Dual Tesla T4 GPUs
     batch_size = 64 if num_gpus >= 2 else 32
     dataset = EnvedaSpectraDataset(df_train, max_peaks=128, n_bits=2048)
     loader = DataLoader(
@@ -157,13 +161,14 @@ def main():
 
     model = model.to(device)
 
-    # Multi-GPU support
+    # Multi-GPU DataParallel
     if num_gpus > 1:
         print(f"Enabling DataParallel across {num_gpus} GPUs.")
         model = nn.DataParallel(model)
 
-    # 4. Losses & Optimizer
-    asl_loss_fn = AsymmetricLoss(gamma_neg=4.0, gamma_pos=1.0, clip=0.05)
+    # 4. Numerically Stable Weighted Losses & Optimizer
+    pos_weight = torch.full((2048,), 25.0, device=device)
+    fp_loss_fn = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
     tanimoto_loss_fn = SoftTanimotoLoss()
     infonce_loss_fn = InfoNCERetrievalLoss(temperature=0.07)
     formula_loss_fn = nn.SmoothL1Loss()
@@ -181,11 +186,11 @@ def main():
     for epoch in range(1, epochs + 1):
         t0 = time.time()
         print(f"\n--- Epoch {epoch}/{epochs} (LR: {optimizer.param_groups[0]['lr']:.6f}) ---")
-        train_loss, asl, tani, info = train_epoch(
+        train_loss, fp_l, tani, info = train_epoch(
             model=model,
             loader=loader,
             optimizer=optimizer,
-            asl_loss_fn=asl_loss_fn,
+            fp_loss_fn=fp_loss_fn,
             tanimoto_loss_fn=tanimoto_loss_fn,
             infonce_loss_fn=infonce_loss_fn,
             formula_loss_fn=formula_loss_fn,
@@ -194,7 +199,7 @@ def main():
         )
         scheduler.step()
         ep_time = time.time() - t0
-        print(f"Epoch {epoch} Complete in {ep_time:.1f}s | Avg Loss: {train_loss:.4f} (ASL: {asl:.4f}, Tani: {tani:.4f}, InfoNCE: {info:.4f})")
+        print(f"Epoch {epoch} Complete in {ep_time:.1f}s | Avg Loss: {train_loss:.4f} (FP: {fp_l:.4f}, Tani: {tani:.4f}, InfoNCE: {info:.4f})")
 
     # 6. Save Model Checkpoint
     checkpoint_dir = "/kaggle/working/checkpoints"
