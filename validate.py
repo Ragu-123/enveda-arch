@@ -82,7 +82,7 @@ def evaluate_validation(
         mask = batch["mask"].to(device)
         target_fp = batch["target_fingerprint"].to(device)
         target_form = batch["target_formula"].to(device)
-        target_smiles = batch["smiles"]
+        target_smiles = batch.get("smiles", None)
         b_size = mzs.size(0)
 
         with torch.amp.autocast('cuda', enabled=(device.type == 'cuda')):
@@ -132,7 +132,7 @@ def evaluate_validation(
         total_samples += b_size
 
         # 3. Realistic Regime B Mass-Window Candidate Ranking Evaluation
-        if cand_masses is not None and regime_b_count < eval_regime_b_samples:
+        if cand_masses is not None and target_smiles is not None and regime_b_count < eval_regime_b_samples:
             for b_idx in range(b_size):
                 if regime_b_count >= eval_regime_b_samples:
                     break

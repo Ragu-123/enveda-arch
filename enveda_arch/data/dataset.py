@@ -188,5 +188,6 @@ class EnvedaSpectraDataset(Dataset):
             "mode": torch.tensor([mode_val], dtype=torch.float32),
             "mask": torch.tensor(mask, dtype=torch.bool),
             "target_fingerprint": torch.from_numpy(target_fp).float(),
-            "target_formula": torch.from_numpy(target_formula).float()
+            "target_formula": torch.from_numpy(target_formula).float(),
+            "smiles": str(row.get('normalized_smiles', ''))
         }
