@@ -205,3 +205,75 @@ def entropy_similarity(qmz: np.ndarray, qp: np.ndarray, cmz: np.ndarray, cp: np.
     if HAS_NUMBA:
         return float(_entropy_sim_numba(np.asarray(qmz, np.float32), np.asarray(qp, np.float32), np.asarray(cmz, np.float32), np.asarray(cp, np.float32), float(tol)))
     return float(_entropy_sim_numpy(np.asarray(qmz, np.float32), np.asarray(qp, np.float32), np.asarray(cmz, np.float32), np.asarray(cp, np.float32), float(tol)))
+
+
+class MassBankLibrary:
+    """
+    In-memory indexed reference library for fast precursor-windowed spectral entropy search.
+    Targets Tier 1 exact reference matching in CASMI 2026.
+    """
+    def __init__(self, parquet_path: str = "/kaggle/input/datasets/samartalwar/casmi-2026-spectral-library-massbankharmonized/spectra.parquet"):
+        self.parquet_path = parquet_path
+        self.loaded = False
+        self.precursor_mzs = np.empty(0, np.float32)
+        self.smiles = []
+        self.inchikeys = []
+        self.ion_modes = []
+        self.mzs_list = []
+        self.ints_list = []
+
+    def load(self, min_mz: float = 230.0, max_mz: float = 475.0) -> bool:
+        import os
+        if not os.path.exists(self.parquet_path):
+            print(f"[WARN] MassBank parquet not found at: {self.parquet_path}")
+            return False
+        import pyarrow.parquet as pq
+        cols = ['smiles', 'inchikey', 'precursor_mz', 'ion_mode', 'mzs', 'intensities']
+        tbl = pq.read_table(self.parquet_path, columns=cols)
+        df = tbl.to_pandas()
+        mask = (df['precursor_mz'] >= min_mz) & (df['precursor_mz'] <= max_mz)
+        df_sub = df[mask].reset_index(drop=True)
+        if len(df_sub) == 0:
+            df_sub = df
+        df_sub = df_sub.sort_values('precursor_mz').reset_index(drop=True)
+        self.precursor_mzs = df_sub['precursor_mz'].to_numpy(dtype=np.float32)
+        self.smiles = df_sub['smiles'].tolist()
+        self.inchikeys = df_sub['inchikey'].tolist()
+        self.ion_modes = df_sub['ion_mode'].astype(str).str.upper().tolist()
+        self.mzs_list = [np.array(m, dtype=np.float32) for m in df_sub['mzs']]
+        self.ints_list = [np.array(it, dtype=np.float32) for it in df_sub['intensities']]
+        self.loaded = True
+        print(f"[OK] MassBankLibrary loaded {len(self.precursor_mzs):,} reference spectra in [{min_mz}, {max_mz}] Da.")
+        return True
+
+    def query(self, prec_mz: float, mode_str: str, qmz: np.ndarray, qit: np.ndarray, tol_ppm: float = 15.0, min_sim: float = 0.80):
+        if not self.loaded:
+            return []
+        tol_da = prec_mz * (tol_ppm * 1e-6)
+        idx_l = int(np.searchsorted(self.precursor_mzs, prec_mz - tol_da))
+        idx_r = int(np.searchsorted(self.precursor_mzs, prec_mz + tol_da))
+        if idx_l >= idx_r:
+            return []
+        
+        target_mode = "POSITIVE" if ("POS" in str(mode_str).upper() or mode_str in ("1", "1.0", 1)) else "NEGATIVE"
+        qm_c, qi_c = clean_peaks(qmz, qit, 0.005, 48, 1.0, True)
+        if len(qm_c) == 0:
+            return []
+
+        matches = []
+        for i in range(idx_l, idx_r):
+            if self.ion_modes[i] != target_mode:
+                continue
+            cm_c, ci_c = clean_peaks(self.mzs_list[i], self.ints_list[i], 0.005, 48, 1.0, True)
+            if len(cm_c) == 0:
+                continue
+            sim = entropy_similarity(qm_c, qi_c, cm_c, ci_c, 0.015)
+            if sim >= min_sim:
+                matches.append({
+                    'smiles': self.smiles[i],
+                    'inchikey': self.inchikeys[i],
+                    'similarity': float(sim),
+                    'library_mz': float(self.precursor_mzs[i])
+                })
+        matches.sort(key=lambda x: x['similarity'], reverse=True)
+        return matches

@@ -261,10 +261,10 @@ def save_and_plot_convergence(
         plt.close(fig)
         print(f"[LIVE PLOT] Updated convergence plot saved to: {output_path}")
 
-def main(epochs: int = 10, max_records: Optional[int] = None, lr: float = 1e-3, val_ratio: float = 0.1):
+def main(epochs: int = 10, max_records: Optional[int] = None, batch_size: int = 256, lr: float = 1e-3, val_ratio: float = 0.1, num_workers: int = 4):
     records_str = "ALL (FULL DATASET: 2.5M)" if (max_records is None or max_records <= 0) else f"{max_records:,}"
     print("=" * 65)
-    print(f"ENVEDA-ARCH: TRAINING SPECCRNEURALOPERATORNET ({epochs} EPOCHS, {records_str})")
+    print(f"ENVEDA-ARCH: TRAINING SPECNEURALOPERATORNET ({epochs} EPOCHS, {records_str})")
     print("=" * 65)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -313,17 +313,19 @@ def main(epochs: int = 10, max_records: Optional[int] = None, lr: float = 1e-3, 
     print(f"  - Structural Overlap: EXACTLY 0 MOLECULES (100% Leak-Free)")
 
     # 2. Build Datasets & DataLoaders
-    batch_size = 64 if num_gpus >= 2 else 32
-    print("\n--- Initializing Training Dataset ---")
+    if torch.cuda.is_available():
+        torch.backends.cudnn.benchmark = True
+    
+    per_gpu = batch_size // max(1, num_gpus)
+    print(f"\n--- Initializing High-Throughput DataLoader (batch_size={batch_size}, per_gpu={per_gpu}, workers={num_workers}) ---")
     train_dataset = EnvedaSpectraDataset(df_train, max_peaks=128, n_bits=2048)
-    print("\n--- Initializing Validation Dataset ---")
     val_dataset = EnvedaSpectraDataset(df_val, max_peaks=128, n_bits=2048)
     
     train_loader = DataLoader(
         train_dataset,
         batch_size=batch_size,
         shuffle=True,
-        num_workers=2,
+        num_workers=num_workers,
         pin_memory=(device.type == 'cuda'),
         drop_last=True
     )
@@ -331,7 +333,7 @@ def main(epochs: int = 10, max_records: Optional[int] = None, lr: float = 1e-3, 
         val_dataset,
         batch_size=batch_size,
         shuffle=False,
-        num_workers=2,
+        num_workers=num_workers,
         pin_memory=(device.type == 'cuda'),
         drop_last=False
     )
@@ -507,7 +509,16 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Train SpecNeuralOperatorNet on MS/MS Spectra")
     parser.add_argument("--epochs", type=int, default=10, help="Number of training epochs (default: 10)")
     parser.add_argument("--max_records", type=int, default=None, help="Number of spectra to load (default: None for full dataset)")
+    parser.add_argument("--batch_size", type=int, default=256, help="Batch size across GPUs (default: 256)")
     parser.add_argument("--lr", type=float, default=1e-3, help="Peak learning rate (default: 1e-3)")
     parser.add_argument("--val_ratio", type=float, default=0.1, help="Validation ratio (default: 0.1)")
+    parser.add_argument("--num_workers", type=int, default=4, help="DataLoader worker processes (default: 4)")
     args = parser.parse_args()
-    main(epochs=args.epochs, max_records=args.max_records, lr=args.lr, val_ratio=args.val_ratio)
+    main(
+        epochs=args.epochs,
+        max_records=args.max_records,
+        batch_size=args.batch_size,
+        lr=args.lr,
+        val_ratio=args.val_ratio,
+        num_workers=args.num_workers
+    )
