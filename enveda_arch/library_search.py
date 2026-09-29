@@ -196,8 +196,12 @@ if HAS_NUMBA:
                 SAB -= v * np.log(v)
         return 1.0 - (2.0 * SAB - SA - SB) / np.log(4.0)
 
-    clean_peaks = _clean_numba
-    entropy_similarity = _entropy_sim_numba
-else:
-    clean_peaks = _clean_numpy
-    entropy_similarity = _entropy_sim_numpy
+def clean_peaks(mz: np.ndarray, it: np.ndarray, floor: float = 0.005, topk: int = 48, power: float = 1.0, ent_weight: bool = True):
+    if HAS_NUMBA:
+        return _clean_numba(np.asarray(mz, np.float32), np.asarray(it, np.float32), float(floor), int(topk), float(power), bool(ent_weight))
+    return _clean_numpy(np.asarray(mz, np.float32), np.asarray(it, np.float32), float(floor), int(topk), float(power), bool(ent_weight))
+
+def entropy_similarity(qmz: np.ndarray, qp: np.ndarray, cmz: np.ndarray, cp: np.ndarray, tol: float = 0.015) -> float:
+    if HAS_NUMBA:
+        return float(_entropy_sim_numba(np.asarray(qmz, np.float32), np.asarray(qp, np.float32), np.asarray(cmz, np.float32), np.asarray(cp, np.float32), float(tol)))
+    return float(_entropy_sim_numpy(np.asarray(qmz, np.float32), np.asarray(qp, np.float32), np.asarray(cmz, np.float32), np.asarray(cp, np.float32), float(tol)))
