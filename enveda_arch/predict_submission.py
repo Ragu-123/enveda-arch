@@ -104,13 +104,17 @@ def run_submission_pipeline():
     model.eval()
     print("[OK] Loaded trained SpecNeuralOperatorNet from checkpoint.")
 
-    # 2. Build or load Candidate Index from train.parquet
-    train_path = "/kaggle/input/competitions/enveda-CASMI26-molecule-id-mass-spectra/train.parquet"
-    cand_masses, cand_fps, cand_smiles, cand_ik14 = build_candidate_index_from_train(
-        train_path,
-        max_records=250000,
-        save_path="/kaggle/working/candidate_index.npz"
-    )
+    # 2. Load Unified Candidate Index (train + COCONUT, 476k structures)
+    cand_path = "/kaggle/working/candidate_index_merged.npz"
+    if not os.path.exists(cand_path):
+        cand_path = "/kaggle/working/candidate_index.npz"
+    print(f"Loading candidate index from: {cand_path}")
+    cand_data = np.load(cand_path, allow_pickle=True)
+    cand_masses = cand_data["masses"]
+    cand_fps = cand_data["fps"]
+    cand_smiles = cand_data["smiles"]
+    cand_ik14 = cand_data["ik14"]
+    print(f"[OK] Loaded {len(cand_masses):,} unified candidates across {cand_masses.min():.2f} - {cand_masses.max():.2f} Da.")
 
     # 3. Load Test Data & Sample Submission
     test_path = "/kaggle/input/competitions/enveda-CASMI26-molecule-id-mass-spectra/test.parquet"
@@ -140,14 +144,23 @@ def run_submission_pipeline():
         all_ret_embeds = []
         all_fp_logits = []
         estimated_masses = []
+        all_adducts = []
+        merged_mzs = []
+        merged_ints = []
 
         for _, spec_row in mol_spectra.iterrows():
             mzs_raw = spec_row.get('ms2_mzs')
             ints_raw = spec_row.get('ms2_normalized_intensities')
             padded_mzs, padded_ints, mask = clean_and_pad_spectrum(mzs_raw, ints_raw, max_peaks=128, min_rel_int=0.005)
 
+            if mzs_raw is not None and len(mzs_raw) > 0:
+                merged_mzs.extend(list(mzs_raw))
+                merged_ints.extend(list(ints_raw))
+
             prec_mz = float(spec_row.get('precursor_mz', 0.0))
             adduct = spec_row.get('adduct', None)
+            if adduct:
+                all_adducts.append(adduct)
             mode_str = spec_row.get('ionization_mode', 'positive')
             mode_val = 1.0 if mode_str == 'positive' else 0.0
 
@@ -187,7 +200,18 @@ def run_submission_pipeline():
         fused_fp_logits = torch.stack(all_fp_logits, dim=0).mean(dim=0)
         fused_ret_embed = F.normalize(torch.stack(all_ret_embeds, dim=0).mean(dim=0), p=2, dim=-1)
 
-        # Candidate retrieval with InChIKey14 deduplication
+        # Clean merged query peaks for in-silico cleavage scoring
+        if len(merged_mzs) > 0:
+            m_arr = np.array(merged_mzs, dtype=np.float32)
+            i_arr = np.array(merged_ints, dtype=np.float32)
+            s_idx = np.argsort(m_arr)
+            query_peaks = (m_arr[s_idx], i_arr[s_idx])
+        else:
+            query_peaks = None
+
+        consensus_adduct = max(set(all_adducts), key=all_adducts.count) if all_adducts else None
+
+        # Candidate retrieval with InChIKey14 deduplication + MetFrag cleavage explainability
         top_25_smiles = retrieve_top_k_candidates(
             target_mass=fused_neutral_mass,
             spec_ret_embed=fused_ret_embed,
@@ -196,6 +220,8 @@ def run_submission_pipeline():
             candidate_fps=cand_fps,
             candidate_smiles=cand_smiles,
             candidate_ik14=cand_ik14,
+            query_peaks=query_peaks,
+            adduct=consensus_adduct,
             model=model,
             top_k=25,
             ppm_tolerance=10.0,

@@ -149,6 +149,27 @@ def build_candidate_index_from_train(
     print(f"[OK] Candidate index built and saved to {save_path} ({len(records)} unique 2D skeletons).")
     return masses, fps, smiles_list, ik14_list
 
+try:
+    from rdkit.Chem.MolStandardize import rdMolStandardize
+    _te = rdMolStandardize.TautomerEnumerator()
+    HAS_STANDARDIZER = True
+except Exception:
+    HAS_STANDARDIZER = False
+
+from enveda_arch.fragmentation import frag_masses_safe, explain_score_adduct
+
+def canon_inchikey14(smi: str) -> str:
+    """Tautomer-canonical 14-character InChIKey."""
+    if HAS_STANDARDIZER:
+        try:
+            m = Chem.MolFromSmiles(smi)
+            if m is not None:
+                can_m = _te.Canonicalize(m)
+                return Chem.MolToInchiKey(can_m)[:14]
+        except Exception:
+            pass
+    return compute_inchikey14(smi)
+
 def retrieve_top_k_candidates(
     target_mass: float,
     spec_ret_embed: torch.Tensor,
@@ -157,17 +178,24 @@ def retrieve_top_k_candidates(
     candidate_fps: np.ndarray,
     candidate_smiles: List[str],
     candidate_ik14: Optional[List[str]] = None,
+    query_peaks: Optional[Tuple[np.ndarray, np.ndarray]] = None,
+    adduct: Optional[str] = None,
+    library_match_smiles: Optional[str] = None,
+    library_match_sim: float = 0.0,
     model: Optional[SpecNeuralOperatorNet] = None,
     top_k: int = 25,
     ppm_tolerance: float = 10.0,
     device: torch.device = torch.device('cuda')
 ) -> List[str]:
     """
-    Fast binary search retrieval within mass window + multi-evidence ranking + InChIKey14 deduplication.
+    Unified High-Performance Retrieval & Ranking Engine:
     Combines:
-    1. Continuous metric cosine similarity in S^2047 (De Waele et al. ICML 2026)
-    2. Vectorized Bernoulli log-likelihood (haideptry Top 1 solution: Score = f_c * z)
-    3. Soft Tanimoto IoU similarity
+    1. InfoNCE Metric Cosine Similarity in S^2047
+    2. Vectorized Bayes Neural Likelihood (Score = f_c * z)
+    3. Soft Tanimoto IoU Overlap
+    4. MetFrag-lite In-Silico Fragment Explainability (adduct-aware bond cleavages)
+    5. Direct Reference Library Match Gate (promotes lib matches >= 0.85 to Rank 1)
+    6. Shortlist Tautomer Canonicalization (eliminates duplicate 2D skeletons)
     """
     tol_da = target_mass * (ppm_tolerance * 1e-6)
     idx_left = np.searchsorted(candidate_masses, target_mass - tol_da)
@@ -191,8 +219,8 @@ def retrieve_top_k_candidates(
         idx_right = min(len(candidate_masses), idx_left + top_k * 2)
 
     cand_sub_fps = torch.tensor(candidate_fps[idx_left:idx_right], dtype=torch.float32, device=device)
-    cand_sub_smiles = candidate_smiles[idx_left:idx_right]
-    cand_sub_ik14 = candidate_ik14[idx_left:idx_right] if candidate_ik14 is not None else None
+    cand_sub_smiles = list(candidate_smiles[idx_left:idx_right])
+    cand_sub_ik14 = list(candidate_ik14[idx_left:idx_right]) if candidate_ik14 is not None else [canon_inchikey14(s) for s in cand_sub_smiles]
 
     if len(cand_sub_smiles) == 0:
         return ["CCO"] * top_k
@@ -200,14 +228,12 @@ def retrieve_top_k_candidates(
     with torch.no_grad():
         # 1. Metric Retrieval Cosine Similarity on Hypersphere S^2047
         cand_sub_embeds = F.normalize(cand_sub_fps, p=2, dim=-1)
-        ret_query = F.normalize(spec_ret_embed.view(1, -1), p=2, dim=-1)
+        ret_query = F.normalize(spec_ret_embed.view(1, -1).float(), p=2, dim=-1)
         sim_ret = torch.matmul(cand_sub_embeds, ret_query.squeeze(0)).cpu().numpy()
 
         # 2. Vectorized Bernoulli Log-Likelihood (Score = f_c * z)
-        # Proven by haideptry (Top 1) to be exact Bayes posterior ranking under independent Bernoulli bits
-        z_query = spec_fp_logits.view(-1)
+        z_query = spec_fp_logits.view(-1).float()
         bayes_scores = torch.matmul(cand_sub_fps, z_query).cpu().numpy()
-        # Min-max scale bayes_scores across the window to [0, 1]
         b_min, b_max = bayes_scores.min(), bayes_scores.max()
         bayes_norm = (bayes_scores - b_min) / (b_max - b_min + 1e-6)
 
@@ -217,19 +243,45 @@ def retrieve_top_k_candidates(
         union = torch.sum(cand_sub_fps + spec_probs - (cand_sub_fps * spec_probs), dim=-1)
         sim_tani = (intersection / (union + 1e-6)).cpu().numpy()
 
-    # Unified Multi-Evidence Ranking Score:
-    # 40% Contrastive Metric Embedding + 35% Bayes Neural Likelihood + 25% Soft Tanimoto
-    unified_scores = 0.40 * sim_ret + 0.35 * bayes_norm + 0.25 * sim_tani
+    # 4. In-Silico Cleavage Explainability
+    if query_peaks is not None and len(query_peaks[0]) > 0:
+        q_mzs, q_ints = query_peaks
+        e_scores = np.zeros(len(cand_sub_smiles), dtype=np.float32)
+        for s_idx, smi_str in enumerate(cand_sub_smiles):
+            fm = frag_masses_safe(smi_str)
+            e_scores[s_idx] = explain_score_adduct(fm, q_mzs, q_ints, adduct=adduct or "[M+H]+", tol=0.015)
+        e_min, e_max = e_scores.min(), e_scores.max()
+        e_norm = (e_scores - e_min) / (e_max - e_min + 1e-6)
+        unified_scores = 0.30 * sim_ret + 0.30 * bayes_norm + 0.15 * sim_tani + 0.25 * e_norm
+    else:
+        unified_scores = 0.40 * sim_ret + 0.35 * bayes_norm + 0.25 * sim_tani
+
+    # 5. Direct Reference Library Match Gate (Tier 1)
+    if library_match_smiles and library_match_sim >= 0.85:
+        lib_k = canon_inchikey14(library_match_smiles)
+        found = False
+        for s_idx, k in enumerate(cand_sub_ik14):
+            if k == lib_k:
+                unified_scores[s_idx] += 100.0  # promote to Rank 1
+                found = True
+                break
+        if not found:
+            # Prepend directly
+            cand_sub_smiles.insert(0, library_match_smiles)
+            cand_sub_ik14.insert(0, lib_k)
+            unified_scores = np.insert(unified_scores, 0, 100.0)
+
     ranked_indices = np.argsort(unified_scores)[::-1]
 
-    # Select top_k candidates with STRICT InChIKey14 deduplication (Udam Liyanage #743254)
+    # 6. Shortlist Canonicalization and Strict InChIKey14 Deduplication
+    shortlist_idx = ranked_indices[: top_k + 20]
     selected = []
     seen_ik14: Set[str] = set()
     seen_smiles: Set[str] = set()
 
-    for idx in ranked_indices:
+    for idx in shortlist_idx:
         s = cand_sub_smiles[idx]
-        ik14 = cand_sub_ik14[idx] if cand_sub_ik14 is not None else compute_inchikey14(s)
+        ik14 = canon_inchikey14(s)
 
         if ik14 not in seen_ik14 and s not in seen_smiles:
             seen_ik14.add(ik14)
@@ -238,7 +290,7 @@ def retrieve_top_k_candidates(
             if len(selected) == top_k:
                 break
 
-    # If still fewer than top_k due to strict deduplication, pad with best remaining SMILES
+    # Fallback padding if strict deduplication resulted in fewer candidates
     for idx in ranked_indices:
         if len(selected) >= top_k:
             break
