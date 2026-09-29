@@ -108,24 +108,24 @@ def run_submission_pipeline():
     cand_path = "/kaggle/working/candidate_index_merged.npz"
     if not os.path.exists(cand_path):
         cand_path = "/kaggle/working/candidate_index.npz"
-    print(f"Loading candidate index from: {cand_path}")
+    print(f"Loading candidate index from: {cand_path}", flush=True)
     cand_data = np.load(cand_path, allow_pickle=True)
     cand_masses = cand_data["masses"]
     cand_fps = cand_data["fps"]
     cand_smiles = cand_data["smiles"]
     cand_ik14 = cand_data["ik14"]
-    print(f"[OK] Loaded {len(cand_masses):,} unified candidates across {cand_masses.min():.2f} - {cand_masses.max():.2f} Da.")
+    print(f"[OK] Loaded {len(cand_masses):,} unified candidates across {cand_masses.min():.2f} - {cand_masses.max():.2f} Da.", flush=True)
 
     # 3. Load Test Data & Sample Submission
     test_path = "/kaggle/input/competitions/enveda-CASMI26-molecule-id-mass-spectra/test.parquet"
     sample_sub_path = "/kaggle/input/competitions/enveda-CASMI26-molecule-id-mass-spectra/sample_submission.csv"
 
-    print("\nLoading test.parquet and sample_submission.csv...")
+    print("\nLoading test.parquet and sample_submission.csv...", flush=True)
     df_test = pd.read_parquet(test_path)
     df_sub = pd.read_csv(sample_sub_path)
     
     unique_mol_ids = df_sub['molecule_id'].unique()
-    print(f"Target molecules to predict: {len(unique_mol_ids)}")
+    print(f"Target molecules to predict: {len(unique_mol_ids)}", flush=True)
 
     grouped_test = df_test.groupby('molecule_id')
 
@@ -153,9 +153,10 @@ def run_submission_pipeline():
             ints_raw = spec_row.get('ms2_normalized_intensities')
             padded_mzs, padded_ints, mask = clean_and_pad_spectrum(mzs_raw, ints_raw, max_peaks=128, min_rel_int=0.005)
 
-            if mzs_raw is not None and len(mzs_raw) > 0:
-                merged_mzs.extend(list(mzs_raw))
-                merged_ints.extend(list(ints_raw))
+            # Collect cleaned peaks (filtered >= 0.5% base peak)
+            if mask.any():
+                merged_mzs.extend(list(padded_mzs[mask]))
+                merged_ints.extend(list(padded_ints[mask]))
 
             prec_mz = float(spec_row.get('precursor_mz', 0.0))
             adduct = spec_row.get('adduct', None)
@@ -200,10 +201,14 @@ def run_submission_pipeline():
         fused_fp_logits = torch.stack(all_fp_logits, dim=0).mean(dim=0)
         fused_ret_embed = F.normalize(torch.stack(all_ret_embeds, dim=0).mean(dim=0), p=2, dim=-1)
 
-        # Clean merged query peaks for in-silico cleavage scoring
+        # Bound merged peaks to top 48 informative fragments for fast cleavage evaluation
         if len(merged_mzs) > 0:
             m_arr = np.array(merged_mzs, dtype=np.float32)
             i_arr = np.array(merged_ints, dtype=np.float32)
+            if len(m_arr) > 48:
+                top_idx = np.argsort(i_arr)[-48:]
+                m_arr = m_arr[top_idx]
+                i_arr = i_arr[top_idx]
             s_idx = np.argsort(m_arr)
             query_peaks = (m_arr[s_idx], i_arr[s_idx])
         else:
@@ -231,9 +236,9 @@ def run_submission_pipeline():
         formatted_smiles = ";".join(top_25_smiles)
         submission_rows.append({"molecule_id": mol_id, "smiles": formatted_smiles})
 
-        if (idx + 1) % 50 == 0 or (idx + 1) == len(unique_mol_ids):
+        if (idx + 1) % 25 == 0 or (idx + 1) == len(unique_mol_ids):
             elapsed = time.time() - t0
-            print(f"  Processed [{idx+1:3d}/{len(unique_mol_ids):3d}] molecules ({elapsed:.1f}s)")
+            print(f"  Processed [{idx+1:3d}/{len(unique_mol_ids):3d}] molecules ({elapsed:.1f}s)", flush=True)
 
     # 4. Save and Validate Output CSV
     out_df = pd.DataFrame(submission_rows)
