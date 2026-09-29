@@ -1,16 +1,19 @@
 """
 Validation & Ranking Evaluation Pipeline for SpecNeuralOperatorNet
-Evaluates multi-task loss components and CASMI MRR@25 / Top-k retrieval metrics.
-Can be invoked per-epoch by train.py or executed standalone as a CLI tool.
+Evaluates:
+1. Multi-task loss components (InfoNCE, Soft Tanimoto, ASL BCE, Formula)
+2. In-Batch Open-Search MRR@25
+3. Realistic CASMI Regime B Mass-Windowed Candidate Ranking MRR@25 (+-8.5 ppm candidate pool)
 """
 
 import os
 import time
-from typing import Dict, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 import numpy as np
 import pandas as pd
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.utils.data import DataLoader
 
 from enveda_arch.models.neural_operator_net import SpecNeuralOperatorNet
@@ -18,6 +21,13 @@ from enveda_arch.losses.asymmetric_loss import AsymmetricLoss
 from enveda_arch.losses.soft_tanimoto_loss import SoftTanimotoLoss
 from enveda_arch.losses.infonce_loss import InfoNCERetrievalLoss
 from enveda_arch.data.dataset import EnvedaSpectraDataset, load_parquet_sample_safe
+from enveda_arch.retrieval import (
+    build_candidate_index_from_train,
+    retrieve_top_k_candidates,
+    get_neutral_mass_from_adduct,
+    compute_inchikey14,
+    PROTON_MASS
+)
 
 @torch.no_grad()
 def evaluate_validation(
@@ -27,10 +37,14 @@ def evaluate_validation(
     tanimoto_loss_fn: nn.Module,
     infonce_loss_fn: nn.Module,
     formula_loss_fn: nn.Module,
-    device: torch.device
+    device: torch.device,
+    cand_index: Optional[Tuple[np.ndarray, np.ndarray, List[str], List[str]]] = None,
+    eval_regime_b_samples: int = 150
 ) -> Dict[str, float]:
     """
-    Evaluates model across validation loader and computes both losses and ranking metrics (MRR@25, Top-1, Top-25).
+    Evaluates model across validation loader and computes both in-batch loss metrics
+    AND realistic CASMI Mass-Windowed MRR@25 (Regime B benchmark: distinguishing the true structure
+    among mass-matched isomers within +-8.5 ppm).
     """
     model.eval()
     raw_model = model.module if hasattr(model, 'module') else model
@@ -41,14 +55,23 @@ def evaluate_validation(
     total_infonce = 0.0
     total_formula = 0.0
     
-    top1_hits = 0
-    top5_hits = 0
-    top25_hits = 0
-    reciprocal_ranks = []
+    inbatch_top1 = 0
+    inbatch_top5 = 0
+    inbatch_top25 = 0
+    inbatch_mrr_list = []
     total_samples = 0
 
+    # Regime B mass-window tracking
+    regime_b_top1 = 0
+    regime_b_top5 = 0
+    regime_b_top25 = 0
+    regime_b_mrr_list = []
+    regime_b_count = 0
+
+    cand_masses, cand_fps, cand_smiles, cand_ik14 = cand_index if cand_index is not None else (None, None, None, None)
+
     from tqdm import tqdm
-    pbar = tqdm(loader, desc="Validating (MRR@25)", total=len(loader), dynamic_ncols=True, leave=False)
+    pbar = tqdm(loader, desc="Validating (Loss & Ranking)", total=len(loader), dynamic_ncols=True, leave=False)
 
     for batch in pbar:
         mzs = batch["mzs"].to(device)
@@ -59,6 +82,7 @@ def evaluate_validation(
         mask = batch["mask"].to(device)
         target_fp = batch["target_fingerprint"].to(device)
         target_form = batch["target_formula"].to(device)
+        target_smiles = batch["smiles"]
         b_size = mzs.size(0)
 
         with torch.amp.autocast('cuda', enabled=(device.type == 'cuda')):
@@ -86,32 +110,114 @@ def evaluate_validation(
         total_infonce += loss_info.item()
         total_formula += loss_form.item()
 
-        # 2. Ranking Evaluation within batch
-        # Cosine similarity matrix: [B, B]
+        # 2. In-Batch Open-Search Ranking Evaluation
         spec_embeds = outputs["retrieval_embedding"]
-        sim_matrix = torch.matmul(spec_embeds, cand_embeds.T) # [B, B]
-        
-        # Rank of ground-truth candidate (diagonal element i, i)
-        ranks = torch.argsort(sim_matrix, dim=-1, descending=True) # [B, B]
-        target_indices = torch.arange(b_size, device=device).unsqueeze(1) # [B, 1]
-        matches = (ranks == target_indices).nonzero(as_tuple=True)[1].cpu().numpy() # [B] rank positions (0-indexed)
+        sim_matrix = torch.matmul(spec_embeds, cand_embeds.T)  # [B, B]
+        ranks = torch.argsort(sim_matrix, dim=-1, descending=True)
+        target_indices = torch.arange(b_size, device=device).unsqueeze(1)
+        matches = (ranks == target_indices).nonzero(as_tuple=True)[1].cpu().numpy()
 
         for rank_pos in matches:
-            rank_1_indexed = rank_pos + 1
-            if rank_1_indexed == 1:
-                top1_hits += 1
-            if rank_1_indexed <= 5:
-                top5_hits += 1
-            if rank_1_indexed <= 25:
-                top25_hits += 1
-                reciprocal_ranks.append(1.0 / rank_1_indexed)
+            r = rank_pos + 1
+            if r == 1:
+                inbatch_top1 += 1
+            if r <= 5:
+                inbatch_top5 += 1
+            if r <= 25:
+                inbatch_top25 += 1
+                inbatch_mrr_list.append(1.0 / r)
             else:
-                reciprocal_ranks.append(0.0)
+                inbatch_mrr_list.append(0.0)
 
         total_samples += b_size
 
+        # 3. Realistic Regime B Mass-Window Candidate Ranking Evaluation
+        if cand_masses is not None and regime_b_count < eval_regime_b_samples:
+            for b_idx in range(b_size):
+                if regime_b_count >= eval_regime_b_samples:
+                    break
+
+                gt_smiles = target_smiles[b_idx]
+                gt_ik14 = compute_inchikey14(gt_smiles)
+                m_val = float(precursor_mz[b_idx].item())
+                mode_v = float(mode[b_idx].item())
+                neutral_mass = m_val - PROTON_MASS if mode_v > 0.5 else m_val + PROTON_MASS
+
+                # Window +-8.5 ppm (optimal per community findings)
+                tol_da = neutral_mass * (8.5 * 1e-6)
+                idx_l = np.searchsorted(cand_masses, neutral_mass - tol_da)
+                idx_r = np.searchsorted(cand_masses, neutral_mass + tol_da)
+                
+                # Ensure minimum 15 candidates for a realistic isomer test
+                if (idx_r - idx_l) < 15:
+                    tol_da = neutral_mass * (25.0 * 1e-6)
+                    idx_l = np.searchsorted(cand_masses, neutral_mass - tol_da)
+                    idx_r = np.searchsorted(cand_masses, neutral_mass + tol_da)
+
+                sub_fps = list(cand_fps[idx_l:idx_r])
+                sub_smiles = list(np.array(cand_smiles)[idx_l:idx_r])
+                sub_ik14 = list(np.array(cand_ik14)[idx_l:idx_r]) if cand_ik14 is not None else [compute_inchikey14(s) for s in sub_smiles]
+
+                # Inject ground truth if not in slice
+                if gt_ik14 not in sub_ik14:
+                    gt_fp = target_fp[b_idx].cpu().numpy()
+                    sub_fps.append(gt_fp)
+                    sub_smiles.append(gt_smiles)
+                    sub_ik14.append(gt_ik14)
+
+                sub_fps_t = torch.tensor(np.array(sub_fps), dtype=torch.float32, device=device)
+                q_embed = spec_embeds[b_idx:b_idx+1]
+                q_logits = outputs["fingerprint_logits"][b_idx:b_idx+1]
+
+                # Ranking using unified score
+                cand_sub_embeds = F.normalize(sub_fps_t, p=2, dim=-1)
+                sim_ret = torch.matmul(cand_sub_embeds, q_embed.squeeze(0)).cpu().numpy()
+
+                z_query = q_logits.view(-1)
+                bayes_scores = torch.matmul(sub_fps_t, z_query).cpu().numpy()
+                b_min, b_max = bayes_scores.min(), bayes_scores.max()
+                bayes_norm = (bayes_scores - b_min) / (b_max - b_min + 1e-6)
+
+                spec_probs = torch.sigmoid(z_query)
+                intersection = torch.sum(sub_fps_t * spec_probs, dim=-1)
+                union = torch.sum(sub_fps_t + spec_probs - (sub_fps_t * spec_probs), dim=-1)
+                sim_tani = (intersection / (union + 1e-6)).cpu().numpy()
+
+                score = 0.40 * sim_ret + 0.35 * bayes_norm + 0.25 * sim_tani
+                ranked_cand_idx = np.argsort(score)[::-1]
+
+                # Deduplicate by InChIKey14 and find GT rank
+                seen_k = set()
+                gt_rank = None
+                curr_rank = 1
+
+                for c_i in ranked_cand_idx:
+                    k14 = sub_ik14[c_i]
+                    if k14 in seen_k:
+                        continue
+                    seen_k.add(k14)
+                    if k14 == gt_ik14:
+                        gt_rank = curr_rank
+                        break
+                    curr_rank += 1
+                    if curr_rank > 25:
+                        break
+
+                if gt_rank is not None and gt_rank <= 25:
+                    if gt_rank == 1:
+                        regime_b_top1 += 1
+                    if gt_rank <= 5:
+                        regime_b_top5 += 1
+                    regime_b_top25 += 1
+                    regime_b_mrr_list.append(1.0 / gt_rank)
+                else:
+                    regime_b_mrr_list.append(0.0)
+
+                regime_b_count += 1
+
     n_batches = max(1, len(loader))
-    mrr_25 = float(np.mean(reciprocal_ranks)) if reciprocal_ranks else 0.0
+    inbatch_mrr = float(np.mean(inbatch_mrr_list)) if inbatch_mrr_list else 0.0
+    regime_b_mrr = float(np.mean(regime_b_mrr_list)) if regime_b_mrr_list else 0.0
 
     return {
         "val_loss": total_loss / n_batches,
@@ -119,10 +225,18 @@ def evaluate_validation(
         "val_tanimoto_loss": total_tani / n_batches,
         "val_infonce_loss": total_infonce / n_batches,
         "val_formula_loss": total_formula / n_batches,
-        "top1_acc": top1_hits / max(1, total_samples),
-        "top5_acc": top5_hits / max(1, total_samples),
-        "top25_acc": top25_hits / max(1, total_samples),
-        "mrr_25": mrr_25
+        "inbatch_top1": inbatch_top1 / max(1, total_samples),
+        "inbatch_top5": inbatch_top5 / max(1, total_samples),
+        "inbatch_top25": inbatch_top25 / max(1, total_samples),
+        "inbatch_mrr25": inbatch_mrr,
+        "regime_b_samples": regime_b_count,
+        "regime_b_top1": regime_b_top1 / max(1, regime_b_count),
+        "regime_b_top5": regime_b_top5 / max(1, regime_b_count),
+        "regime_b_top25": regime_b_top25 / max(1, regime_b_count),
+        "regime_b_mrr25": regime_b_mrr,
+        "mrr_25": regime_b_mrr if regime_b_count > 0 else inbatch_mrr,
+        "top1_acc": regime_b_top1 / max(1, regime_b_count) if regime_b_count > 0 else inbatch_top1 / max(1, total_samples),
+        "top25_acc": regime_b_top25 / max(1, regime_b_count) if regime_b_count > 0 else inbatch_top25 / max(1, total_samples)
     }
 
 def main(
@@ -132,7 +246,7 @@ def main(
     batch_size: int = 64
 ):
     print("=" * 65)
-    print("ENVEDA-ARCH: STANDALONE VALIDATION EVALUATION")
+    print("ENVEDA-ARCH: DUAL REGIME VALIDATION EVALUATION")
     print("=" * 65)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -140,6 +254,20 @@ def main(
 
     if not os.path.exists(checkpoint_path):
         raise FileNotFoundError(f"Checkpoint not found at: {checkpoint_path}")
+
+    # Load candidate index for Regime B evaluation
+    cand_index = None
+    cand_index_path = "/kaggle/working/candidate_index.npz"
+    if os.path.exists(cand_index_path):
+        print(f"Loading candidate index from {cand_index_path}...")
+        data = np.load(cand_index_path, allow_pickle=True)
+        cand_index = (
+            data["masses"],
+            data["fps"],
+            list(data["smiles"]),
+            list(data["ik14"]) if "ik14" in data.files else None
+        )
+        print(f"[OK] Loaded {len(data['masses'])} candidate structures.")
 
     # Load validation slice
     print(f"\nLoading {max_records} validation records via PyArrow...")
@@ -169,7 +297,6 @@ def main(
     model = model.to(device)
     print("[OK] Checkpoint loaded successfully.")
 
-    # Loss functions
     fp_loss_fn = AsymmetricLoss(gamma_neg=2.0, gamma_pos=0.0, clip=0.05)
     tanimoto_loss_fn = SoftTanimotoLoss()
     infonce_loss_fn = InfoNCERetrievalLoss(temperature=0.15)
@@ -183,7 +310,9 @@ def main(
         tanimoto_loss_fn=tanimoto_loss_fn,
         infonce_loss_fn=infonce_loss_fn,
         formula_loss_fn=formula_loss_fn,
-        device=device
+        device=device,
+        cand_index=cand_index,
+        eval_regime_b_samples=150
     )
     elapsed = time.time() - t0
 
@@ -197,10 +326,18 @@ def main(
     print(f"Morgan BCE Loss:     {metrics['val_fp_loss']:.4f}")
     print(f"Formula Loss:        {metrics['val_formula_loss']:.4f}")
     print("-" * 65)
-    print(f"Top-1 Accuracy:      {metrics['top1_acc'] * 100:.2f}%")
-    print(f"Top-5 Accuracy:      {metrics['top5_acc'] * 100:.2f}%")
-    print(f"Top-25 Accuracy:     {metrics['top25_acc'] * 100:.2f}%")
-    print(f"CASMI MRR@25 Score:  {metrics['mrr_25']:.4f}")
+    print("IN-BATCH OPEN SEARCH METRICS (UNCONSTRAINED DECOYS):")
+    print(f"  Top-1 Accuracy:    {metrics['inbatch_top1'] * 100:.2f}%")
+    print(f"  Top-5 Accuracy:    {metrics['inbatch_top5'] * 100:.2f}%")
+    print(f"  Top-25 Accuracy:   {metrics['inbatch_top25'] * 100:.2f}%")
+    print(f"  In-Batch MRR@25:   {metrics['inbatch_mrr25']:.4f}")
+    print("-" * 65)
+    if metrics["regime_b_samples"] > 0:
+        print(f"REGIME B MASS-WINDOWED METRICS (+-8.5 ppm, {metrics['regime_b_samples']} molecules):")
+        print(f"  Top-1 Accuracy:    {metrics['regime_b_top1'] * 100:.2f}%")
+        print(f"  Top-5 Accuracy:    {metrics['regime_b_top5'] * 100:.2f}%")
+        print(f"  Top-25 Accuracy:   {metrics['regime_b_top25'] * 100:.2f}%")
+        print(f"  CASMI MRR@25:      {metrics['regime_b_mrr25']:.4f}")
     print("=" * 65)
 
 if __name__ == "__main__":
