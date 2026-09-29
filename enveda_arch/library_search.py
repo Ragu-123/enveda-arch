@@ -209,15 +209,22 @@ def entropy_similarity(qmz: np.ndarray, qp: np.ndarray, cmz: np.ndarray, cp: np.
 
 class MassBankLibrary:
     """
-    In-memory indexed reference library for fast precursor-windowed spectral entropy search.
-    Targets Tier 1 exact reference matching in CASMI 2026.
+    In-memory indexed reference library for fast precursor-windowed and neutral-mass-windowed
+    spectral entropy search. Targets Tier 1 exact reference matching in CASMI 2026.
+    Supports dual-index search:
+      1. Precursor m/z window (+-10 ppm) for same-adduct matching
+      2. Exact neutral mass window (+-10 ppm) for cross-adduct matching
     """
     def __init__(self, parquet_path: str = "/kaggle/input/datasets/samartalwar/casmi-2026-spectral-library-massbankharmonized/spectra.parquet"):
         self.parquet_path = parquet_path
         self.loaded = False
         self.precursor_mzs = np.empty(0, np.float32)
+        self.exact_masses = np.empty(0, np.float32)
+        self.sorted_exact_masses = np.empty(0, np.float32)
+        self.exact_mass_order = np.empty(0, np.int64)
         self.smiles = []
         self.inchikeys = []
+        self.inchikey14s = []
         self.ion_modes = []
         self.mzs_list = []
         self.ints_list = []
@@ -228,52 +235,97 @@ class MassBankLibrary:
             print(f"[WARN] MassBank parquet not found at: {self.parquet_path}")
             return False
         import pyarrow.parquet as pq
-        cols = ['smiles', 'inchikey', 'precursor_mz', 'ion_mode', 'mzs', 'intensities']
+        cols = ['smiles', 'inchikey', 'precursor_mz', 'exact_mass', 'ion_mode', 'mzs', 'intensities']
         tbl = pq.read_table(self.parquet_path, columns=cols)
         df = tbl.to_pandas()
-        mask = (df['precursor_mz'] >= min_mz) & (df['precursor_mz'] <= max_mz)
+        
+        # Filter to competition window (either precursor or exact mass within window)
+        mask = (
+            ((df['precursor_mz'] >= min_mz) & (df['precursor_mz'] <= max_mz)) |
+            ((df['exact_mass'] >= min_mz - 5.0) & (df['exact_mass'] <= max_mz + 5.0))
+        )
         df_sub = df[mask].reset_index(drop=True)
         if len(df_sub) == 0:
             df_sub = df
+        
+        # Sort primarily by precursor_mz for fast search
         df_sub = df_sub.sort_values('precursor_mz').reset_index(drop=True)
         self.precursor_mzs = df_sub['precursor_mz'].to_numpy(dtype=np.float32)
+        self.exact_masses = df_sub['exact_mass'].to_numpy(dtype=np.float32)
+        
+        # Secondary index: sorted order by exact_mass
+        self.exact_mass_order = np.argsort(self.exact_masses)
+        self.sorted_exact_masses = self.exact_masses[self.exact_mass_order]
+        
         self.smiles = df_sub['smiles'].tolist()
         self.inchikeys = df_sub['inchikey'].tolist()
+        self.inchikey14s = [str(k)[:14] if isinstance(k, str) else '' for k in self.inchikeys]
         self.ion_modes = df_sub['ion_mode'].astype(str).str.upper().tolist()
         self.mzs_list = [np.array(m, dtype=np.float32) for m in df_sub['mzs']]
         self.ints_list = [np.array(it, dtype=np.float32) for it in df_sub['intensities']]
         self.loaded = True
-        print(f"[OK] MassBankLibrary loaded {len(self.precursor_mzs):,} reference spectra in [{min_mz}, {max_mz}] Da.")
+        print(f"[OK] MassBankLibrary loaded {len(self.precursor_mzs):,} reference spectra in [{min_mz}, {max_mz}] Da (Dual Precursor & Neutral Mass Indexes active).")
         return True
 
-    def query(self, prec_mz: float, mode_str: str, qmz: np.ndarray, qit: np.ndarray, tol_ppm: float = 15.0, min_sim: float = 0.80):
+    def query(self, prec_mz: float, neutral_mass: Optional[float], mode_str: str, qmz: np.ndarray, qit: np.ndarray,
+              tol_ppm: float = 12.0, min_sim: float = 0.85, min_peaks: int = 4):
+        """
+        Query reference library using both precursor m/z and deconvoluted neutral mass.
+        FDR Guardrails:
+          - Requires at least `min_peaks` (default: 4) clean fragment peaks
+          - Strict spectral entropy threshold `min_sim` (default: 0.85)
+          - Precursor / neutral mass tolerance `tol_ppm` (default: 12.0 ppm)
+        """
         if not self.loaded:
             return []
+
+        # 1. FDR Guardrail: require sufficient query peak information
+        qm_c, qi_c = clean_peaks(qmz, qit, 0.005, 48, 1.0, True)
+        if len(qm_c) < min_peaks:
+            return []
+
+        target_mode = "POSITIVE" if ("POS" in str(mode_str).upper() or mode_str in ("1", "1.0", 1)) else "NEGATIVE"
+        
+        candidate_indices = set()
+        
+        # 2. Precursor m/z window search (+- tol_ppm)
         tol_da = prec_mz * (tol_ppm * 1e-6)
         idx_l = int(np.searchsorted(self.precursor_mzs, prec_mz - tol_da))
         idx_r = int(np.searchsorted(self.precursor_mzs, prec_mz + tol_da))
-        if idx_l >= idx_r:
-            return []
-        
-        target_mode = "POSITIVE" if ("POS" in str(mode_str).upper() or mode_str in ("1", "1.0", 1)) else "NEGATIVE"
-        qm_c, qi_c = clean_peaks(qmz, qit, 0.005, 48, 1.0, True)
-        if len(qm_c) == 0:
+        for i in range(idx_l, idx_r):
+            if self.ion_modes[i] == target_mode:
+                candidate_indices.add(i)
+
+        # 3. Cross-adduct neutral mass window search (+- tol_ppm)
+        if neutral_mass is not None and neutral_mass > 50.0:
+            tol_neutral = neutral_mass * (tol_ppm * 1e-6)
+            n_idx_l = int(np.searchsorted(self.sorted_exact_masses, neutral_mass - tol_neutral))
+            n_idx_r = int(np.searchsorted(self.sorted_exact_masses, neutral_mass + tol_neutral))
+            for k in range(n_idx_l, n_idx_r):
+                orig_i = int(self.exact_mass_order[k])
+                if self.ion_modes[orig_i] == target_mode:
+                    candidate_indices.add(orig_i)
+
+        if not candidate_indices:
             return []
 
+        # 4. Evaluate spectral entropy similarity
         matches = []
-        for i in range(idx_l, idx_r):
-            if self.ion_modes[i] != target_mode:
-                continue
+        for i in candidate_indices:
             cm_c, ci_c = clean_peaks(self.mzs_list[i], self.ints_list[i], 0.005, 48, 1.0, True)
-            if len(cm_c) == 0:
+            if len(cm_c) < 3:
                 continue
             sim = entropy_similarity(qm_c, qi_c, cm_c, ci_c, 0.015)
             if sim >= min_sim:
                 matches.append({
                     'smiles': self.smiles[i],
                     'inchikey': self.inchikeys[i],
+                    'inchikey14': self.inchikey14s[i],
                     'similarity': float(sim),
-                    'library_mz': float(self.precursor_mzs[i])
+                    'library_prec_mz': float(self.precursor_mzs[i]),
+                    'library_exact_mass': float(self.exact_masses[i])
                 })
+        
+        # Rank by spectral entropy similarity descending
         matches.sort(key=lambda x: x['similarity'], reverse=True)
         return matches
