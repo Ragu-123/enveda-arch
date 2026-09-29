@@ -166,8 +166,8 @@ def evaluate_validation(
                     sub_ik14.append(gt_ik14)
 
                 sub_fps_t = torch.tensor(np.array(sub_fps), dtype=torch.float32, device=device)
-                q_embed = spec_embeds[b_idx:b_idx+1]
-                q_logits = outputs["fingerprint_logits"][b_idx:b_idx+1]
+                q_embed = spec_embeds[b_idx:b_idx+1].float()
+                q_logits = outputs["fingerprint_logits"][b_idx:b_idx+1].float()
 
                 # Ranking using unified score
                 cand_sub_embeds = F.normalize(sub_fps_t, p=2, dim=-1)
@@ -257,7 +257,9 @@ def main(
 
     # Load candidate index for Regime B evaluation
     cand_index = None
-    cand_index_path = "/kaggle/working/candidate_index.npz"
+    cand_index_path = "/kaggle/working/candidate_index_merged.npz"
+    if not os.path.exists(cand_index_path):
+        cand_index_path = "/kaggle/working/candidate_index.npz"
     if os.path.exists(cand_index_path):
         print(f"Loading candidate index from {cand_index_path}...")
         data = np.load(cand_index_path, allow_pickle=True)
