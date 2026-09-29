@@ -173,7 +173,7 @@ def evaluate_validation(
                 cand_sub_embeds = F.normalize(sub_fps_t, p=2, dim=-1)
                 sim_ret = torch.matmul(cand_sub_embeds, q_embed.squeeze(0)).cpu().numpy()
 
-                z_query = q_logits.view(-1)
+                z_query = q_logits.view(-1).float()
                 bayes_scores = torch.matmul(sub_fps_t, z_query).cpu().numpy()
                 b_min, b_max = bayes_scores.min(), bayes_scores.max()
                 bayes_norm = (bayes_scores - b_min) / (b_max - b_min + 1e-6)
