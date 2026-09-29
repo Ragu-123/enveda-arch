@@ -294,7 +294,7 @@ def main(epochs: int = 10, max_records: Optional[int] = None, batch_size: int = 
     rng = np.random.RandomState(42)
     rng.shuffle(unique_groups)
 
-    n_val_groups = max(10, int(len(unique_groups) * val_ratio))
+    n_val_groups = min(max(10, int(len(unique_groups) * val_ratio)), 2500)
     val_groups_set = set(unique_groups[:n_val_groups])
 
     val_mask = df_raw[group_col].isin(val_groups_set)

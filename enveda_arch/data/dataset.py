@@ -76,9 +76,14 @@ def load_parquet_sample_safe(
     max_records: Optional[int] = None
 ) -> pd.DataFrame:
     """
-    Safely loads records from a Parquet file using PyArrow row groups.
-    If max_records is None or <= 0, safely streams the entire dataset.
+    Safely loads records from a Parquet file using PyArrow.
+    If max_records is None or <= 0, reads directly via PyArrow C++ engine to eliminate
+    the pd.concat peak memory duplication spike.
     """
+    if max_records is None or max_records <= 0:
+        table = pq.read_table(parquet_path, columns=columns)
+        return table.to_pandas()
+
     pf = pq.ParquetFile(parquet_path)
     dfs = []
     total_loaded = 0
@@ -88,11 +93,11 @@ def load_parquet_sample_safe(
         df_rg = tbl.to_pandas()
         dfs.append(df_rg)
         total_loaded += len(df_rg)
-        if max_records is not None and max_records > 0 and total_loaded >= max_records:
+        if total_loaded >= max_records:
             break
 
     full_df = pd.concat(dfs, ignore_index=True)
-    if max_records is not None and max_records > 0 and len(full_df) > max_records:
+    if len(full_df) > max_records:
         full_df = full_df.iloc[:max_records]
     return full_df
 
