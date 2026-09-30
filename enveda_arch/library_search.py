@@ -4,6 +4,7 @@ Implements fast continuous spectral entropy (Li et al. Nature Methods 2021) and
 precursor-shifted matching to detect exact and analog library references.
 """
 
+from typing import Optional, List, Tuple, Dict, Union
 import numpy as np
 try:
     from numba import njit, prange
