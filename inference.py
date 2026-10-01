@@ -24,6 +24,7 @@ import torch.nn.functional as F
 from enveda_arch.models.neural_operator_net import SpecNeuralOperatorNet
 from enveda_arch.retrieval import (
     build_candidate_index_from_train,
+    build_unified_candidate_universe,
     retrieve_top_k_candidates,
     get_neutral_mass_from_adduct,
     compute_inchikey14,
@@ -31,6 +32,7 @@ from enveda_arch.retrieval import (
     PROTON_MASS
 )
 from enveda_arch.library_search import clean_peaks, MassBankLibrary
+from enveda_arch.forward_scoring import rerank_by_insilico_cleavage, rerank_isomers_formula_grouped
 
 def clean_and_pad_spectrum(
     mzs_raw: list, ints_raw: list, max_peaks: int = 128, min_rel_int: float = 0.005
@@ -104,36 +106,37 @@ def find_checkpoint(explicit_path: Optional[str] = None) -> str:
     )
 
 def find_or_build_candidate_index(
-    index_path: Optional[str] = None,
-    train_parquet_path: str = "/kaggle/input/competitions/enveda-CASMI26-molecule-id-mass-spectra/train.parquet"
-) -> Tuple[np.ndarray, np.ndarray, List[str], List[str]]:
-    """Loads pre-built candidate index, or builds it from train.parquet if missing."""
+    index_path: Optional[str] = None
+) -> Tuple[np.ndarray, List[str], List[str]]:
+    """Loads pre-built unified candidate index or dynamically builds it from COCONUT 2.0 & BIO DB."""
     candidates_to_check = [
         index_path,
+        "/kaggle/working/candidate_index_unified.npz",
         "/kaggle/working/candidate_index_merged.npz",
-        "/kaggle/working/candidate_index.npz",
-        "candidate_index_merged.npz",
-        "candidate_index.npz"
+        "candidate_index_unified.npz",
+        "candidate_index_merged.npz"
     ]
     for p in candidates_to_check:
         if p and os.path.exists(p):
-            print(f"[OK] Loading candidate index from: {p}")
-            data = np.load(p, allow_pickle=True)
-            return (
-                data["masses"],
-                data["fps"],
-                list(data["smiles"]),
-                list(data["ik14"]) if "ik14" in data.files else None
-            )
+            try:
+                data = np.load(p, allow_pickle=True)
+                if len(data["masses"]) > 300000:
+                    print(f"[OK] Loading verified candidate index from: {p} ({len(data['masses']):,} compounds)")
+                    return (
+                        data["masses"],
+                        list(data["smiles"]),
+                        list(data["ik14"]) if "ik14" in data.files else None
+                    )
+            except Exception:
+                pass
 
-    print(f"[INIT] Precomputed candidate index not found. Building from {train_parquet_path}...")
-    save_path = "/kaggle/working/candidate_index.npz"
-    masses, fps, smiles, ik14 = build_candidate_index_from_train(
-        train_parquet_path=train_parquet_path,
-        max_records=250000,
-        save_path=save_path
+    print("[INIT] Building Unified Candidate Universe from COCONUT 2.0 and BIO DB...")
+    masses, smiles, ik14 = build_unified_candidate_universe(
+        min_mass=239.5,
+        max_mass=465.5,
+        save_path="/kaggle/working/candidate_index_unified.npz"
     )
-    return masses, fps, smiles, ik14
+    return masses, smiles, ik14
 
 def run_inference(
     checkpoint_path: Optional[str] = None,
@@ -175,10 +178,10 @@ def run_inference(
     print("[OK] Loaded trained weights into SpecNeuralOperatorNet.")
 
     # 2. Candidate Index
-    cand_masses, cand_fps, cand_smiles, cand_ik14 = find_or_build_candidate_index(
+    cand_masses, cand_smiles, cand_ik14 = find_or_build_candidate_index(
         index_path=candidate_index_path
     )
-    print(f"[OK] Candidate database ready: {len(cand_masses):,} structures loaded.")
+    print(f"[OK] Unified Candidate database ready: {len(cand_masses):,} structures loaded.")
 
     # 3. Optional Reference Library
     mb_lib = None
@@ -306,7 +309,7 @@ def run_inference(
             spec_ret_embed=fused_ret_embed,
             spec_fp_logits=fused_fp_logits,
             candidate_masses=cand_masses,
-            candidate_fps=cand_fps,
+            candidate_fps=None,
             candidate_smiles=cand_smiles,
             candidate_ik14=cand_ik14,
             query_peaks=query_peaks,

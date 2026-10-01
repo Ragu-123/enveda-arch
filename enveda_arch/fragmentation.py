@@ -6,10 +6,14 @@ the constitutional isomer bottleneck (98% of candidate ranking failures).
 
 import numpy as np
 from typing import List, Tuple, Optional, Set
-from rdkit import Chem
-from rdkit import RDLogger
-
-RDLogger.DisableLog("rdApp.*")
+try:
+    from rdkit import Chem
+    from rdkit import RDLogger
+    RDLogger.DisableLog("rdApp.*")
+    HAS_RDKIT = True
+except Exception:
+    Chem = None
+    HAS_RDKIT = False
 
 # Monoisotopic atomic weights
 AMU = {
@@ -52,6 +56,8 @@ CARRIERS = {
 }
 
 def mol_graph(smi: str):
+    if not HAS_RDKIT or Chem is None:
+        return None
     m = Chem.MolFromSmiles(smi)
     if m is None:
         return None
