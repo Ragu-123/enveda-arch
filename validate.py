@@ -38,6 +38,7 @@ def evaluate_validation(
     infonce_loss_fn: nn.Module,
     formula_loss_fn: nn.Module,
     device: torch.device,
+    fwd_loss_fn: Optional[nn.Module] = None,
     cand_index: Optional[Tuple[np.ndarray, np.ndarray, List[str], List[str]]] = None,
     eval_regime_b_samples: int = 150
 ) -> Dict[str, float]:
@@ -54,6 +55,7 @@ def evaluate_validation(
     total_tani = 0.0
     total_infonce = 0.0
     total_formula = 0.0
+    total_fwd = 0.0
     
     inbatch_top1 = 0
     inbatch_top5 = 0
@@ -71,6 +73,7 @@ def evaluate_validation(
     cand_masses, cand_fps, cand_smiles, cand_ik14 = cand_index if cand_index is not None else (None, None, None, None)
 
     from tqdm import tqdm
+    from enveda_arch.losses import build_spectral_density_target
     pbar = tqdm(loader, desc="Validating (Loss & Ranking)", total=len(loader), dynamic_ncols=True, leave=False)
 
     for batch in pbar:
@@ -80,6 +83,12 @@ def evaluate_validation(
         collision_energy = batch["collision_energy"].to(device)
         mode = batch["mode"].to(device)
         mask = batch["mask"].to(device)
+        adduct_ix = batch.get("adduct_ix", None)
+        instr_ix = batch.get("instr_ix", None)
+        if adduct_ix is not None:
+            adduct_ix = adduct_ix.to(device)
+        if instr_ix is not None:
+            instr_ix = instr_ix.to(device)
         target_fp = batch["target_fingerprint"].to(device)
         target_form = batch["target_formula"].to(device)
         target_smiles = batch.get("smiles", None)
@@ -92,7 +101,9 @@ def evaluate_validation(
                 precursor_mz=precursor_mz,
                 collision_energy=collision_energy,
                 mode=mode,
-                mask=mask
+                mask=mask,
+                adduct_ix=adduct_ix,
+                instr_ix=instr_ix
             )
 
             # 1. Multi-task loss terms
@@ -102,13 +113,21 @@ def evaluate_validation(
             loss_info = infonce_loss_fn(outputs["retrieval_embedding"], cand_embeds)
             loss_form = formula_loss_fn(outputs["formula_preds"], target_form)
 
-            batch_loss = 5.0 * loss_fp + 1.0 * loss_info + 0.1 * loss_form
+            if fwd_loss_fn is not None:
+                target_density = build_spectral_density_target(mzs, intensities, mask=mask, num_bins=512)
+                fwd_density = raw_model.predict_forward_spectrum(target_fp, precursor_mz, collision_energy, mode)
+                loss_fwd = fwd_loss_fn(fwd_density, target_density)
+            else:
+                loss_fwd = torch.tensor(0.0, device=device)
+
+            batch_loss = 1.0 * loss_fp + 2.0 * loss_tani + 1.0 * loss_info + 0.1 * loss_form + 0.5 * loss_fwd
 
         total_loss += batch_loss.item()
         total_fp += loss_fp.item()
         total_tani += loss_tani.item()
         total_infonce += loss_info.item()
         total_formula += loss_form.item()
+        total_fwd += loss_fwd.item()
 
         # 2. In-Batch Open-Search Ranking Evaluation
         spec_embeds = outputs["retrieval_embedding"]

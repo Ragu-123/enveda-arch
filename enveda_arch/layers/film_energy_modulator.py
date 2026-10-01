@@ -15,7 +15,7 @@ class FiLMEnergyModulator(nn.Module):
             nn.Linear(d_model, 2 * d_model)
         )
         # Initialize gamma to 0 (so 1 + gamma starts as identity) and beta to 0
-        nn.init.zeros_(self.cond_net[-1].weight)
+        nn.init.normal_(self.cond_net[-1].weight, std=0.01)
         nn.init.zeros_(self.cond_net[-1].bias)
 
     def forward(self, x: torch.Tensor, cond: torch.Tensor) -> torch.Tensor:

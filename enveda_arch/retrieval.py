@@ -27,21 +27,28 @@ from enveda_arch.data.dataset import smiles_to_morgan_fingerprint
 PROTON_MASS = 1.007276
 
 # Exact high-precision adduct monoisotopic mass offsets
-# neutral_mass = precursor_mz + offset
-ADDUCT_MASS_OFFSETS = {
-    '[M+H]+': -1.007276,
-    '[M+Na]+': -22.989218,
-    '[M+NH4]+': -18.033826,
-    '[M+K]+': -38.963158,
-    '[M-H]-': +1.007276,
-    '[M+CH2O2-H]-': -44.998201,  # formate adduct (loss of H + addition of HCOO-)
-    '[M+Cl]-': -34.969402,
+# Exact high-precision adduct monoisotopic mass deconvolution rules
+ADDUCT_RULES = {
+    '[M+H]+': lambda m: m - 1.007276,
+    '[M+Na]+': lambda m: m - 22.989218,
+    '[M+NH4]+': lambda m: m - 18.033826,
+    '[M+K]+': lambda m: m - 38.963158,
+    '[M-H]-': lambda m: m + 1.007276,
+    '[M+CH2O2-H]-': lambda m: m - 44.998201,  # formate adduct (loss of H + addition of HCOO-)
+    '[M+Cl]-': lambda m: m - 34.969402,
+    '[2M+H]+': lambda m: (m - 1.007276) / 2.0,
+    '[2M+Na]+': lambda m: (m - 22.989218) / 2.0,
+    '[2M-H]-': lambda m: (m + 1.007276) / 2.0,
+    '[2M+NH4]+': lambda m: (m - 18.033826) / 2.0,
+    '[2M+K]+': lambda m: (m - 38.963158) / 2.0,
+    '[M+2H]2+': lambda m: (m * 2.0) - (2 * 1.007276),
+    '[M-2H]2-': lambda m: (m * 2.0) + (2 * 1.007276),
 }
 
 def get_neutral_mass_from_adduct(precursor_mz: float, adduct: Optional[str], mode: str) -> float:
     """Computes exact neutral mass from precursor m/z, adduct, and ionization mode."""
-    if adduct and adduct in ADDUCT_MASS_OFFSETS:
-        return precursor_mz + ADDUCT_MASS_OFFSETS[adduct]
+    if adduct and adduct in ADDUCT_RULES:
+        return float(ADDUCT_RULES[adduct](precursor_mz))
     if mode == 'positive':
         return precursor_mz - PROTON_MASS
     else:

@@ -38,7 +38,6 @@ class DualStreamConjugateFusion(nn.Module):
             nn.Sigmoid()
         )
 
-        self.out_proj = nn.Linear(hidden_dim * 2, hidden_dim)
         self.norm = nn.LayerNorm(hidden_dim)
 
     def forward(

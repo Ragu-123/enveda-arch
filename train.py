@@ -10,6 +10,7 @@ Trains Multiscale Continuous Neural Operator with:
 - Real-Time Live Plotting (Train vs Val) saved directly to /kaggle/working
 """
 
+import math
 import os
 import time
 from typing import Dict, Optional, Tuple
@@ -22,9 +23,13 @@ from torch.utils.data import DataLoader
 
 from tqdm import tqdm
 from enveda_arch.models.neural_operator_net import SpecNeuralOperatorNet
-from enveda_arch.losses.asymmetric_loss import AsymmetricLoss
-from enveda_arch.losses.soft_tanimoto_loss import SoftTanimotoLoss
-from enveda_arch.losses.infonce_loss import InfoNCERetrievalLoss
+from enveda_arch.losses import (
+    BalancedSubstructureLoss,
+    SoftTanimotoLoss,
+    InfoNCERetrievalLoss,
+    ForwardSpectralLoss,
+    build_spectral_density_target
+)
 from enveda_arch.data.dataset import EnvedaSpectraDataset, load_parquet_sample_safe
 from validate import evaluate_validation
 
@@ -32,10 +37,12 @@ def train_epoch(
     model: nn.Module,
     loader: DataLoader,
     optimizer: torch.optim.Optimizer,
+    scheduler: Optional[torch.optim.lr_scheduler.LRScheduler],
     fp_loss_fn: nn.Module,
     tanimoto_loss_fn: nn.Module,
     infonce_loss_fn: nn.Module,
     formula_loss_fn: nn.Module,
+    fwd_loss_fn: nn.Module,
     scaler: torch.amp.GradScaler,
     device: torch.device,
     history: dict,
@@ -48,6 +55,7 @@ def train_epoch(
     total_tanimoto = 0.0
     total_infonce = 0.0
     total_formula = 0.0
+    total_fwd = 0.0
     total_loss = 0.0
     start_time = time.time()
 
@@ -68,9 +76,17 @@ def train_epoch(
         collision_energy = batch["collision_energy"].to(device)
         mode = batch["mode"].to(device)
         mask = batch["mask"].to(device)
+        adduct_ix = batch.get("adduct_ix", None)
+        instr_ix = batch.get("instr_ix", None)
+        if adduct_ix is not None:
+            adduct_ix = adduct_ix.to(device)
+        if instr_ix is not None:
+            instr_ix = instr_ix.to(device)
         
         target_fp = batch["target_fingerprint"].to(device)
         target_form = batch["target_formula"].to(device)
+        hard_neg_fps = batch.get("hard_neg_fps", None)
+        b_size = mzs.size(0)
 
         optimizer.zero_grad(set_to_none=True)
 
@@ -81,25 +97,41 @@ def train_epoch(
                 precursor_mz=precursor_mz,
                 collision_energy=collision_energy,
                 mode=mode,
-                mask=mask
+                mask=mask,
+                adduct_ix=adduct_ix,
+                instr_ix=instr_ix
             )
 
-            # 1. Asymmetric Loss for multi-label fingerprint prediction (gamma_neg=2.0, clip=0.05)
+            # 1. Balanced Substructure Loss (O(1) positive bit gradients without dilution)
             loss_fp = fp_loss_fn(outputs["fingerprint_logits"], target_fp)
 
-            # 2. Metric InfoNCE Retrieval Loss (fixed target canonical fingerprint space, De Waele et al. 2026 ICML)
-            cand_embeds = raw_model.project_candidate_fingerprint(target_fp)
-            loss_info = infonce_loss_fn(outputs["retrieval_embedding"], cand_embeds)
+            # 2. Differentiable Soft Tanimoto IoU Loss (ACTIVELY BACKPROPAGATED)
+            loss_tani = tanimoto_loss_fn(outputs["fingerprint_logits"], target_fp)
 
-            # 3. Molecular formula auxiliary loss
+            # 3. Hard-Negative Isomer Contrastive Loss (Mass-matched +-25 ppm isomers)
+            if hard_neg_fps is not None:
+                hard_neg_fps = hard_neg_fps.to(device)
+                all_cands = torch.cat([target_fp.unsqueeze(1), hard_neg_fps], dim=1) # [B, 1+K, 2048]
+                all_cand_embeds = raw_model.project_candidate_fingerprint(all_cands) # [B, 1+K, 2048]
+                q = outputs["retrieval_embedding"].unsqueeze(1) # [B, 1, 2048]
+                sim_logits = torch.sum(q * all_cand_embeds, dim=-1) / 0.10 # [B, 1+K]
+                loss_info = F.cross_entropy(sim_logits, torch.zeros(b_size, dtype=torch.long, device=device))
+                iso_acc = (sim_logits.argmax(dim=-1) == 0).float().mean()
+            else:
+                cand_embeds = raw_model.project_candidate_fingerprint(target_fp)
+                loss_info = infonce_loss_fn(outputs["retrieval_embedding"], cand_embeds)
+                iso_acc = torch.tensor(0.0)
+
+            # 4. Molecular formula auxiliary loss
             loss_form = formula_loss_fn(outputs["formula_preds"], target_form)
 
-            # 4. Soft Tanimoto IoU (logged as diagnostic metric, not backpropagated to avoid opposing Bayes regret)
-            with torch.no_grad():
-                loss_tani = tanimoto_loss_fn(outputs["fingerprint_logits"], target_fp)
+            # 5. Dual-Sided Forward Spectral Reconstruction Loss
+            target_density = build_spectral_density_target(mzs, intensities, mask=mask, num_bins=512)
+            fwd_density = raw_model.predict_forward_spectrum(target_fp, precursor_mz, collision_energy, mode)
+            loss_fwd = fwd_loss_fn(fwd_density, target_density)
 
-            # Well-conditioned non-conflicting objective
-            loss = 5.0 * loss_fp + 1.0 * loss_info + 0.1 * loss_form
+            # Well-conditioned balanced objective with full-strength gradients
+            loss = 1.0 * loss_fp + 2.0 * loss_tani + 1.0 * loss_info + 0.1 * loss_form + 0.5 * loss_fwd
 
         # Robust defensive check
         if torch.isnan(loss) or torch.isinf(loss):
@@ -112,19 +144,23 @@ def train_epoch(
         scaler.step(optimizer)
         scaler.update()
 
+        if scheduler is not None:
+            scheduler.step()
+
         total_fp += loss_fp.item()
         total_tanimoto += loss_tani.item()
         total_infonce += loss_info.item()
         total_formula += loss_form.item()
+        total_fwd += loss_fwd.item()
         total_loss += loss.item()
 
         # Update tqdm live metrics display
         pbar.set_postfix({
             "Loss": f"{loss.item():.4f}",
-            "ASL": f"{loss_fp.item():.4f}",
+            "FP": f"{loss_fp.item():.4f}",
             "Tani": f"{loss_tani.item():.4f}",
-            "InfoNCE": f"{loss_info.item():.4f}",
-            "Form": f"{loss_form.item():.4f}"
+            "IsoAcc": f"{iso_acc.item()*100:.1f}%",
+            "Fwd": f"{loss_fwd.item():.4f}"
         })
 
         # Record step-by-step history every 10 steps
@@ -281,7 +317,8 @@ def main(epochs: int = 10, max_records: Optional[int] = None, batch_size: int = 
     columns = [
         'ms2_mzs', 'ms2_normalized_intensities',
         'precursor_mz', 'collision_energy_ev', 'ionization_mode',
-        'normalized_smiles', 'molecular_formula', 'inchikey14'
+        'normalized_smiles', 'molecular_formula', 'inchikey14',
+        'adduct', 'instrument_type'
     ]
     df_raw = load_parquet_sample_safe(train_path, columns=columns, max_records=max_records)
     print(f"[OK] Safely loaded {len(df_raw):,} records with zero memory spike.")
@@ -318,8 +355,23 @@ def main(epochs: int = 10, max_records: Optional[int] = None, batch_size: int = 
     
     per_gpu = batch_size // max(1, num_gpus)
     print(f"\n--- Initializing High-Throughput DataLoader (batch_size={batch_size}, per_gpu={per_gpu}, workers={num_workers}) ---")
-    train_dataset = EnvedaSpectraDataset(df_train, max_peaks=128, n_bits=2048)
-    val_dataset = EnvedaSpectraDataset(df_val, max_peaks=128, n_bits=2048)
+    train_dataset = EnvedaSpectraDataset(
+        df_train,
+        max_peaks=128,
+        n_bits=2048,
+        augment=True,
+        sample_hard_negs=True,
+        num_hard_negs=15,
+        num_workers=num_workers
+    )
+    val_dataset = EnvedaSpectraDataset(
+        df_val,
+        max_peaks=128,
+        n_bits=2048,
+        augment=False,
+        sample_hard_negs=False,
+        num_workers=num_workers
+    )
     
     train_loader = DataLoader(
         train_dataset,
@@ -345,10 +397,11 @@ def main(epochs: int = 10, max_records: Optional[int] = None, batch_size: int = 
         retrieval_dim=2048,
         fingerprint_dim=2048,
         formula_dim=10,
-        num_operator_layers=2,
-        sigmas=(0.02, 0.5, 5.0, 28.0),
-        num_heads=4,
-        fourier_dim=128
+        num_layers=6,
+        num_heads=8,
+        fourier_dim=256,
+        spectrum_bins=512,
+        dropout=0.1
     )
     
     total_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -362,13 +415,21 @@ def main(epochs: int = 10, max_records: Optional[int] = None, batch_size: int = 
         model = nn.DataParallel(model)
 
     # 4. Numerically Stable Weighted Losses & Optimizer
-    fp_loss_fn = AsymmetricLoss(gamma_neg=2.0, gamma_pos=0.0, clip=0.05)
+    fp_loss_fn = BalancedSubstructureLoss(neg_weight=0.25)
     tanimoto_loss_fn = SoftTanimotoLoss()
-    infonce_loss_fn = InfoNCERetrievalLoss(temperature=0.15)
+    infonce_loss_fn = InfoNCERetrievalLoss(temperature=0.10)
     formula_loss_fn = nn.SmoothL1Loss()
+    fwd_loss_fn = ForwardSpectralLoss()
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs, eta_min=1e-5)
+    total_steps = epochs * len(train_loader)
+    warmup_steps = min(500, max(50, total_steps // 20))
+    def lr_lambda(step):
+        if step < warmup_steps:
+            return float(step + 1) / float(max(1, warmup_steps))
+        progress = float(step - warmup_steps) / float(max(1, total_steps - warmup_steps))
+        return 1e-5 / lr + 0.5 * (1.0 - 1e-5 / lr) * (1.0 + math.cos(math.pi * progress))
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
     scaler = torch.amp.GradScaler('cuda', enabled=(device.type == 'cuda'))
 
     step_history = {
@@ -421,10 +482,12 @@ def main(epochs: int = 10, max_records: Optional[int] = None, batch_size: int = 
             model=model,
             loader=train_loader,
             optimizer=optimizer,
+            scheduler=scheduler,
             fp_loss_fn=fp_loss_fn,
             tanimoto_loss_fn=tanimoto_loss_fn,
             infonce_loss_fn=infonce_loss_fn,
             formula_loss_fn=formula_loss_fn,
+            fwd_loss_fn=fwd_loss_fn,
             scaler=scaler,
             device=device,
             history=step_history,
@@ -432,7 +495,6 @@ def main(epochs: int = 10, max_records: Optional[int] = None, batch_size: int = 
             epochs=epochs,
             log_file=log_file
         )
-        scheduler.step()
 
         # 2. Per-Epoch Validation Evaluation
         val_metrics = evaluate_validation(
@@ -442,7 +504,8 @@ def main(epochs: int = 10, max_records: Optional[int] = None, batch_size: int = 
             tanimoto_loss_fn=tanimoto_loss_fn,
             infonce_loss_fn=infonce_loss_fn,
             formula_loss_fn=formula_loss_fn,
-            device=device
+            device=device,
+            fwd_loss_fn=fwd_loss_fn
         )
 
         ep_time = time.time() - t0
