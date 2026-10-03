@@ -59,6 +59,38 @@ class SinEmb(nn.Module):
         a = x.unsqueeze(-1) * self.inv
         return torch.cat([torch.sin(a), torch.cos(a)], dim=-1)
 
+class MDHDEmb(nn.Module):
+    """
+    Mass Defect Harmonic Decomposition (MDHD) Coordinate Encoder.
+    Decomposes exact physical mass coordinate m into:
+    1. Macro Nominal Scale: M_nom = floor(m), covering 0 to 2000 Da.
+    2. Micro Mass Defect Scale: delta = m - floor(m), covering nuclear binding defects with sub-ppm Fourier harmonics.
+    """
+    def __init__(self, dim: int):
+        super().__init__()
+        half = dim // 2
+        n_nom = half // 2
+        wav_nom = torch.pow(10.0, torch.linspace(0.0, 3.3, n_nom))
+        self.register_buffer('inv_nom', (2 * math.pi) / wav_nom)
+
+        n_def = half - n_nom
+        wav_def = torch.pow(10.0, torch.linspace(-4.0, 0.0, n_def))
+        self.register_buffer('inv_def', (2 * math.pi) / wav_def)
+        self.proj = nn.Linear(dim, dim)
+
+    def forward(self, m: torch.Tensor) -> torch.Tensor:
+        m_clamped = m.clamp(min=0.0)
+        m_nom = torch.floor(m_clamped)
+        m_def = m_clamped - m_nom
+
+        a_nom = m_nom.unsqueeze(-1) * self.inv_nom
+        emb_nom = torch.cat([torch.sin(a_nom), torch.cos(a_nom)], dim=-1)
+
+        a_def = m_def.unsqueeze(-1) * self.inv_def
+        emb_def = torch.cat([torch.sin(a_def), torch.cos(a_def)], dim=-1)
+
+        return self.proj(torch.cat([emb_nom, emb_def], dim=-1))
+
 class TransformerBlock(nn.Module):
     """
     FlashAttention Transformer Block with LayerNorm and FeedForward MLP.
@@ -157,8 +189,8 @@ class SpecNeuralOperatorNet(nn.Module):
     def __init__(
         self,
         hidden_dim: int = 256,
-        retrieval_dim: int = 2048,
-        fingerprint_dim: int = 2048,
+        retrieval_dim: int = 512,
+        fingerprint_dim: int = 10226,
         formula_dim: int = 10,
         num_layers: int = 6,
         num_heads: int = 8,
@@ -172,9 +204,9 @@ class SpecNeuralOperatorNet(nn.Module):
         self.fingerprint_dim = fingerprint_dim
         self.formula_dim = formula_dim
 
-        # 1. Continuous Coordinate Harmonic Encoders
-        self.mz_emb = SinEmb(hidden_dim)
-        self.nl_emb = SinEmb(hidden_dim)
+        # 1. Mass Defect Harmonic Decomposition (MDHD) Coordinate Encoders
+        self.mz_emb = MDHDEmb(hidden_dim)
+        self.nl_emb = MDHDEmb(hidden_dim)
         self.prec_emb = SinEmb(hidden_dim)
 
         # Peak feature projection: [mz_emb(d) + nl_emb(d) + 3 (I, sqrt(I), log1p(I))] -> hidden_dim
@@ -211,6 +243,9 @@ class SpecNeuralOperatorNet(nn.Module):
             nn.Linear(hidden_dim * 4, retrieval_dim)
         )
 
+        # Projection from molecular fingerprint space to retrieval embedding space
+        self.cand_proj = nn.Linear(fingerprint_dim, retrieval_dim, bias=False)
+
         # Head C: Molecular Formula Elemental Atom Counts
         self.head_formula = nn.Sequential(
             nn.Linear(2 * hidden_dim, hidden_dim),
@@ -231,7 +266,8 @@ class SpecNeuralOperatorNet(nn.Module):
         Projects candidate binary fingerprint vectors into L2-normalized metric retrieval space.
         Target space is fixed canonical chemical structure ground truth.
         """
-        return F.normalize(cand_fps.float(), p=2, dim=-1)
+        proj = self.cand_proj(cand_fps.float())
+        return F.normalize(proj, p=2, dim=-1)
 
     def predict_forward_spectrum(
         self,

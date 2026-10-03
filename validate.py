@@ -20,6 +20,7 @@ from enveda_arch.models.neural_operator_net import SpecNeuralOperatorNet
 from enveda_arch.losses.asymmetric_loss import AsymmetricLoss
 from enveda_arch.losses.soft_tanimoto_loss import SoftTanimotoLoss
 from enveda_arch.losses.infonce_loss import InfoNCERetrievalLoss
+from enveda_arch.kernels import unpack_bits_torch
 from enveda_arch.data.dataset import EnvedaSpectraDataset, load_parquet_sample_safe
 from enveda_arch.retrieval import (
     build_candidate_index_from_train,
@@ -89,7 +90,8 @@ def evaluate_validation(
             adduct_ix = adduct_ix.to(device)
         if instr_ix is not None:
             instr_ix = instr_ix.to(device)
-        target_fp = batch["target_fingerprint"].to(device)
+        
+        target_fp = batch.get("target_fingerprint_packed", batch.get("target_fingerprint", None)).to(device)
         target_form = batch["target_formula"].to(device)
         target_smiles = batch.get("smiles", None)
         b_size = mzs.size(0)
@@ -109,13 +111,15 @@ def evaluate_validation(
             # 1. Multi-task loss terms
             loss_fp = fp_loss_fn(outputs["fingerprint_logits"], target_fp)
             loss_tani = tanimoto_loss_fn(outputs["fingerprint_logits"], target_fp)
-            cand_embeds = raw_model.project_candidate_fingerprint(target_fp)
+            
+            unpacked_target = unpack_bits_torch(target_fp, n_bits=raw_model.fingerprint_dim) if target_fp.dtype == torch.uint8 else target_fp
+            cand_embeds = raw_model.project_candidate_fingerprint(unpacked_target)
             loss_info = infonce_loss_fn(outputs["retrieval_embedding"], cand_embeds)
             loss_form = formula_loss_fn(outputs["formula_preds"], target_form)
 
             if fwd_loss_fn is not None:
                 target_density = build_spectral_density_target(mzs, intensities, mask=mask, num_bins=512)
-                fwd_density = raw_model.predict_forward_spectrum(target_fp, precursor_mz, collision_energy, mode)
+                fwd_density = raw_model.predict_forward_spectrum(unpacked_target, precursor_mz, collision_energy, mode)
                 loss_fwd = fwd_loss_fn(fwd_density, target_density)
             else:
                 loss_fwd = torch.tensor(0.0, device=device)

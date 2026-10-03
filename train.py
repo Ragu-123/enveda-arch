@@ -24,11 +24,14 @@ from torch.utils.data import DataLoader
 
 from tqdm import tqdm
 from enveda_arch.models.neural_operator_net import SpecNeuralOperatorNet
+from enveda_arch.kernels import unpack_bits_torch
 from enveda_arch.losses import (
+    AsymmetricLoss,
     BalancedSubstructureLoss,
     SoftTanimotoLoss,
     InfoNCERetrievalLoss,
     ForwardSpectralLoss,
+    PlackettLuceIsomerLoss,
     build_spectral_density_target
 )
 from enveda_arch.data.dataset import EnvedaSpectraDataset, load_parquet_sample_safe
@@ -84,9 +87,9 @@ def train_epoch(
         if instr_ix is not None:
             instr_ix = instr_ix.to(device)
         
-        target_fp = batch["target_fingerprint"].to(device)
+        target_fp = batch.get("target_fingerprint_packed", batch.get("target_fingerprint", None)).to(device)
         target_form = batch["target_formula"].to(device)
-        hard_neg_fps = batch.get("hard_neg_fps", None)
+        hard_neg_fps = batch.get("hard_neg_fps_packed", batch.get("hard_neg_fps", None))
         b_size = mzs.size(0)
 
         optimizer.zero_grad(set_to_none=True)
@@ -103,23 +106,31 @@ def train_epoch(
                 instr_ix=instr_ix
             )
 
-            # 1. Balanced Substructure Loss (O(1) positive bit gradients without dilution)
+            # 1. Asymmetric Fingerprint Loss (Fused Triton if uint8 target, or standard)
             loss_fp = fp_loss_fn(outputs["fingerprint_logits"], target_fp)
 
-            # 2. Differentiable Soft Tanimoto IoU Loss (ACTIVELY BACKPROPAGATED)
+            # 2. Differentiable Soft Tanimoto IoU Loss (Fused Triton if uint8 target, or standard)
             loss_tani = tanimoto_loss_fn(outputs["fingerprint_logits"], target_fp)
+
+            # Unpack target if needed for projection head and forward spectral decoder
+            unpacked_target = unpack_bits_torch(target_fp, n_bits=raw_model.fingerprint_dim) if target_fp.dtype == torch.uint8 else target_fp
 
             # 3. Hard-Negative Isomer Contrastive Loss (Mass-matched +-25 ppm isomers)
             if hard_neg_fps is not None:
                 hard_neg_fps = hard_neg_fps.to(device)
-                all_cands = torch.cat([target_fp.unsqueeze(1), hard_neg_fps], dim=1) # [B, 1+K, 2048]
-                all_cand_embeds = raw_model.project_candidate_fingerprint(all_cands) # [B, 1+K, 2048]
-                q = outputs["retrieval_embedding"].unsqueeze(1) # [B, 1, 2048]
+                if hard_neg_fps.dtype == torch.uint8:
+                    unpacked_negs = unpack_bits_torch(hard_neg_fps.view(-1, hard_neg_fps.shape[-1]), n_bits=raw_model.fingerprint_dim).view(b_size, -1, raw_model.fingerprint_dim)
+                    all_cands = torch.cat([unpacked_target.unsqueeze(1), unpacked_negs], dim=1)
+                else:
+                    all_cands = torch.cat([unpacked_target.unsqueeze(1), hard_neg_fps], dim=1)
+                
+                all_cand_embeds = raw_model.project_candidate_fingerprint(all_cands) # [B, 1+K, retrieval_dim]
+                q = outputs["retrieval_embedding"].unsqueeze(1) # [B, 1, retrieval_dim]
                 sim_logits = torch.sum(q * all_cand_embeds, dim=-1) / 0.10 # [B, 1+K]
                 loss_info = F.cross_entropy(sim_logits, torch.zeros(b_size, dtype=torch.long, device=device))
                 iso_acc = (sim_logits.argmax(dim=-1) == 0).float().mean()
             else:
-                cand_embeds = raw_model.project_candidate_fingerprint(target_fp)
+                cand_embeds = raw_model.project_candidate_fingerprint(unpacked_target)
                 loss_info = infonce_loss_fn(outputs["retrieval_embedding"], cand_embeds)
                 iso_acc = torch.tensor(0.0)
 
@@ -128,7 +139,7 @@ def train_epoch(
 
             # 5. Dual-Sided Forward Spectral Reconstruction Loss
             target_density = build_spectral_density_target(mzs, intensities, mask=mask, num_bins=512)
-            fwd_density = raw_model.predict_forward_spectrum(target_fp, precursor_mz, collision_energy, mode)
+            fwd_density = raw_model.predict_forward_spectrum(unpacked_target, precursor_mz, collision_energy, mode)
             loss_fwd = fwd_loss_fn(fwd_density, target_density)
 
             # Well-conditioned balanced objective with full-strength gradients
@@ -298,10 +309,21 @@ def save_and_plot_convergence(
         plt.close(fig)
         print(f"[LIVE PLOT] Updated convergence plot saved to: {output_path}")
 
-def main(epochs: int = 10, max_records: Optional[int] = None, batch_size: int = 256, lr: float = 1e-3, val_ratio: float = 0.1, num_workers: int = 4):
+def main(
+    epochs: int = 10,
+    max_records: Optional[int] = None,
+    batch_size: int = 256,
+    n_bits: int = 10226,
+    retrieval_dim: int = 512,
+    lr: float = 1e-3,
+    val_ratio: float = 0.1,
+    num_workers: int = 4,
+    pool_dir: Optional[str] = "/kaggle/input/datasets/ahmedberatozer/casmi26-v2-pool"
+):
     records_str = "ALL (FULL DATASET: 2.5M)" if (max_records is None or max_records <= 0) else f"{max_records:,}"
     print("=" * 65)
     print(f"ENVEDA-ARCH: TRAINING SPECNEURALOPERATORNET ({epochs} EPOCHS, {records_str})")
+    print(f"Target Fingerprint Dimension: {n_bits} bits | Retrieval Dimension: {retrieval_dim}")
     print("=" * 65)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -359,19 +381,21 @@ def main(epochs: int = 10, max_records: Optional[int] = None, batch_size: int = 
     train_dataset = EnvedaSpectraDataset(
         df_train,
         max_peaks=128,
-        n_bits=2048,
+        n_bits=n_bits,
         augment=True,
         sample_hard_negs=True,
         num_hard_negs=15,
-        num_workers=num_workers
+        num_workers=num_workers,
+        pool_dir=pool_dir
     )
     val_dataset = EnvedaSpectraDataset(
         df_val,
         max_peaks=128,
-        n_bits=2048,
+        n_bits=n_bits,
         augment=False,
         sample_hard_negs=False,
-        num_workers=num_workers
+        num_workers=num_workers,
+        pool_dir=pool_dir
     )
     
     train_loader = DataLoader(
@@ -395,8 +419,8 @@ def main(epochs: int = 10, max_records: Optional[int] = None, batch_size: int = 
     # 3. Instantiate Novel Architecture
     model = SpecNeuralOperatorNet(
         hidden_dim=256,
-        retrieval_dim=2048,
-        fingerprint_dim=2048,
+        retrieval_dim=retrieval_dim,
+        fingerprint_dim=n_bits,
         formula_dim=10,
         num_layers=6,
         num_heads=8,
@@ -416,7 +440,7 @@ def main(epochs: int = 10, max_records: Optional[int] = None, batch_size: int = 
         model = nn.DataParallel(model)
 
     # 4. Numerically Stable Weighted Losses & Optimizer
-    fp_loss_fn = BalancedSubstructureLoss(neg_weight=0.25)
+    fp_loss_fn = AsymmetricLoss(gamma_neg=2.0, gamma_pos=0.0, clip=0.05)
     tanimoto_loss_fn = SoftTanimotoLoss()
     infonce_loss_fn = InfoNCERetrievalLoss(temperature=0.10)
     formula_loss_fn = nn.SmoothL1Loss()
@@ -574,15 +598,21 @@ if __name__ == "__main__":
     parser.add_argument("--epochs", type=int, default=10, help="Number of training epochs (default: 10)")
     parser.add_argument("--max_records", type=int, default=None, help="Number of spectra to load (default: None for full dataset)")
     parser.add_argument("--batch_size", type=int, default=256, help="Batch size across GPUs (default: 256)")
+    parser.add_argument("--n_bits", type=int, default=10226, help="Target fingerprint dimension (default: 10226)")
+    parser.add_argument("--retrieval_dim", type=int, default=512, help="Retrieval projection dimension (default: 512)")
     parser.add_argument("--lr", type=float, default=1e-3, help="Peak learning rate (default: 1e-3)")
     parser.add_argument("--val_ratio", type=float, default=0.1, help="Validation ratio (default: 0.1)")
     parser.add_argument("--num_workers", type=int, default=4, help="DataLoader worker processes (default: 4)")
+    parser.add_argument("--pool_dir", type=str, default="/kaggle/input/datasets/ahmedberatozer/casmi26-v2-pool", help="Path to precomputed candidate pool")
     args = parser.parse_args()
     main(
         epochs=args.epochs,
         max_records=args.max_records,
         batch_size=args.batch_size,
+        n_bits=args.n_bits,
+        retrieval_dim=args.retrieval_dim,
         lr=args.lr,
         val_ratio=args.val_ratio,
-        num_workers=args.num_workers
+        num_workers=args.num_workers,
+        pool_dir=args.pool_dir
     )
